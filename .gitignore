@@ -4,3 +4,4 @@ __pycache__/
 exp.ipynb
 *.pyc
 .DS_Store
+data.json

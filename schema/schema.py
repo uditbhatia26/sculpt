@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import Annotated
 
 class parsedJobDescription(BaseModel):
@@ -9,3 +9,15 @@ class parsedJobDescription(BaseModel):
 
 class JDRequest(BaseModel):
     job_description: Annotated[str, Field(..., description="Job Description provided by the user")]
+
+
+class UserSignup(BaseModel):
+    id: Annotated[str, Field(..., description="ID of the user")]
+    name: Annotated[str, Field(..., description="User's name", min_length=3)]
+    email: Annotated[EmailStr, Field(..., description="Email of the user")]
+    password: Annotated[str, Field(..., description="User's password", min_length=6)]
+
+
+class UserLogin(BaseModel):
+    email: Annotated[EmailStr, Field(..., description="Email of the user")]
+    password: Annotated[str, Field(..., description="Password of the user")]
