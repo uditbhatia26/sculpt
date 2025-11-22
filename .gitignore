@@ -5,3 +5,6 @@ exp.ipynb
 *.pyc
 .DS_Store
 data.json
+*.pdf
+*.yaml
+debug*/
