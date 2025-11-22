@@ -1,4 +1,5 @@
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from config.prompts import res2yaml_system_prompt, jd_template
 from schema.schema import parsedJobDescription
@@ -9,6 +10,7 @@ load_dotenv()
 
 MODEL_NAME = "llama-3.3-70b-versatile"
 groq_llm = ChatGroq(api_key=os.getenv("GROQ_API_KEY"), model=MODEL_NAME)
+openai_llm = ChatOpenAI(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
 
 prompt = ChatPromptTemplate(
         [
