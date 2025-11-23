@@ -6,7 +6,7 @@ class parsedJobDescription(BaseModel):
     job_description : Annotated[str, Field(..., description="Job Description")]
     job_title : Annotated[str, Field(..., description="Job Title")]
 
-
+# Not being used
 class JDRequest(BaseModel):
     job_description: Annotated[str, Field(..., description="Job Description provided by the user")]
 
@@ -21,3 +21,13 @@ class UserSignup(BaseModel):
 class UserLogin(BaseModel):
     email: Annotated[EmailStr, Field(..., description="Email of the user")]
     password: Annotated[str, Field(..., description="Password of the user")]
+
+
+class CalculateATS(BaseModel):
+    user_id: Annotated[str, Field(..., description="ID of the user")]
+    job_desc: Annotated[str, Field(..., description="Job Description provided by the user")]
+
+
+class ATS(BaseModel):
+    ats_score: Annotated[int, Field(..., description="ATS score of the resume according to the job description", gt=0, le=100)]
+    reason: Annotated[str, Field(description="Reason for the score")]
