@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.responses import JSONResponse
-from schema.schema import JDRequest, parsedJobDescription, UserLogin, UserSignup
+from schema.schema import UserLogin, UserSignup, CalculateATS, ATS
 from dotenv import load_dotenv
 from config.file_helpers import load_data, save_data
 from io import BytesIO
@@ -8,11 +8,19 @@ import yaml
 from datetime import datetime
 import os
 from PyPDF2 import PdfReader
-from models.chains import jd_parser_chain, groq_llm, res2yaml_chain
+from models.chains import jd_parser_chain, llm, res2yaml_chain, ats_chain
+from config.resume_functions import ats, parse_jd
 import logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()   
+    ]
+)
+logger = logging.getLogger("Sculpt")
 load_dotenv()
 
 
@@ -30,7 +38,7 @@ def home():
 def health():
     return {
         "status": "OK",
-        "model_loaded": groq_llm is not None,
+        "model_loaded": llm is not None,
 
     }
 
@@ -71,32 +79,10 @@ def authenticate_user(credentials: UserLogin):
     )
 
 # ---------------------------- Sample code for signup and login ---------------------------- #
-
-
-# FIX 1: Handle the entered job description, currently not able to send it via a curl request
-@app.post("/job_description", response_model=parsedJobDescription)
-async def parse_jd(request: JDRequest):
-    try:
-        response = await jd_parser_chain.ainvoke(
-            input = {
-                'job_description': request.job_description
-            },
-        )
-        return response
-
-    except Exception as e:
-        logger.error(f"Failed to parse job description: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "Failed to process job description with LLM",
-                "message": str(e)
-            }
-        )
     
 
 @app.post('/upload-resume')
-async def upload_resume(user_id: str, file: UploadFile = File("Resume of the user")):
+async def upload_resume(user_id: str, file: UploadFile = File(..., description="Resume of the user")):
     if not user_id or not user_id.strip():
         raise HTTPException(
             status_code=400,
@@ -119,7 +105,10 @@ async def upload_resume(user_id: str, file: UploadFile = File("Resume of the use
     if file.content_type != "application/pdf":
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are allowed."
+            detail={
+                "message": "Only PDF files are allowed.",
+                "current_file_type": file.content_type
+            }
         )
     
     if (int(file.size) / 1048576) > 2:
@@ -196,3 +185,51 @@ async def upload_resume(user_id: str, file: UploadFile = File("Resume of the use
             "filename": yaml_filename,
         }
     )
+
+
+@app.post('/calculate-ats', response_model=ATS)
+async def calculate_ats(request: CalculateATS):
+    logger.info(f"Calculating ATS for user {request.user_id}")
+    if not request.user_id or not request.user_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="User ID cannot be empty"
+        )
+    
+    if not request.job_desc or not request.job_desc.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Job description cannot be empty"
+        )
+    
+    parsed_jd = await parse_jd(job_description=request.job_desc)
+    
+    data = load_data(FILE_PATH)
+
+    if request.user_id not in data:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+    
+    try:
+        resume_yaml = data[request.user_id]['resume_yaml']
+
+    except KeyError as e:
+        logger.error(f"Resume not found for user {request.user_id}: {str(e)}")
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Resume for the user is not available, {str(e)}"
+        )
+    
+    try:
+        response = await ats(resume_yaml, parsed_jd)
+        logger.info(f"ATS calculated successfully for user {request.user_id}: {response.ats_score}")
+        return response
+    
+    except Exception as e:
+        logger.error(f"Failed to calculate ATS for user {request.user_id}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to calculate ATS, {str(e)}"
+        )
