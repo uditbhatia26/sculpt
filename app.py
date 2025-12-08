@@ -1,17 +1,17 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.responses import JSONResponse
-from schema.schema import UserLogin, UserSignup, CalculateATS, ATS
+from schema.schema import UserLogin, UserSignup, CalculateATS
 from dotenv import load_dotenv
 from config.file_helpers import load_data, save_data
 from io import BytesIO
-from schema.schema import DetailedATS, OptimizeResumeRequest, OptimizedResumeResponse
+from schema.schema import DetailedATS, OptimizeResumeRequest
 from config.resume_functions import ats_detailed, optimize_resume
 import yaml
 from datetime import datetime
 import os
 from PyPDF2 import PdfReader
-from models.chains import jd_parser_chain, llm, res2yaml_chain, ats_chain
-from config.resume_functions import ats, parse_jd
+from models.chains import llm, res2yaml_chain
+from config.resume_functions import parse_jd
 import logging
 
 logging.basicConfig(
