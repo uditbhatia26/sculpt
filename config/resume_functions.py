@@ -4,8 +4,9 @@ from models.chains import (
     enhanced_ats_chain, 
     optimization_chain
 )
+from schema.schema import parsedJobDescription
 
-async def ats(resume_content: str, job_description):
+async def ats(resume_content: str, job_description: parsedJobDescription):
     """Based on the given job description score the given resume (OLD VERSION)"""
     response = await ats_chain.ainvoke(
         input={
@@ -17,7 +18,7 @@ async def ats(resume_content: str, job_description):
     )
     return response
 
-async def ats_detailed(resume_content: str, job_description):
+async def ats_detailed(resume_content: str, job_description: parsedJobDescription):
     """Enhanced ATS calculation with detailed breakdown"""
     response = await enhanced_ats_chain.ainvoke(
         input={

@@ -155,6 +155,7 @@ async def upload_resume(user_id: str, file: UploadFile = File(..., description="
 
     resume_yaml = response.content
 
+    # Remove any backticks
     if "```" in resume_yaml:
         resume_yaml = resume_yaml.split("```yaml")[-1] if "```yaml" in resume_yaml else resume_yaml.split("```")[-1]
         resume_yaml = resume_yaml.split("```")[0]
@@ -239,7 +240,7 @@ async def upload_resume(user_id: str, file: UploadFile = File(..., description="
 #             detail=f"Unable to calculate ATS, {str(e)}"
 #         )
 
-    
+
 @app.post('/calculate-ats-detailed', response_model=DetailedATS)
 async def calculate_ats_detailed(request: CalculateATS):
     """Enhanced ATS calculation with detailed breakdown and actionable feedback"""
@@ -317,6 +318,11 @@ async def optimize_resume_endpoint(request: OptimizeResumeRequest):
             job_description=parsed_jd,
             addons= "" # data[request.user_id]['addons']
         )
+
+        if "```" in optimized_yaml:
+            optimized_yaml = optimized_yaml.split("```yaml")[-1] if "```yaml" in optimized_yaml else optimized_yaml.split("```")[-1]
+            optimized_yaml = optimized_yaml.split("```")[0]
+            optimized_yaml = optimized_yaml.strip()
         
         # Calculate optimized ATS score
         optimized_ats = await ats_detailed(optimized_yaml, parsed_jd)
@@ -337,12 +343,12 @@ async def optimize_resume_endpoint(request: OptimizeResumeRequest):
             f"Added {len(optimized_ats.keyword_analysis.matched_keywords) - len(original_ats.keyword_analysis.matched_keywords)} more matching keywords",
         ]
         
-        # Add specific improvements from the detailed analysis
-        if len(original_ats.keyword_analysis.missing_critical_keywords) > len(optimized_ats.keyword_analysis.missing_critical_keywords):
-            improvements_made.append("Integrated critical missing keywords")
+        # # Add specific improvements from the detailed analysis
+        # if len(original_ats.keyword_analysis.missing_critical_keywords) > len(optimized_ats.keyword_analysis.missing_critical_keywords):
+        #     improvements_made.append("Integrated critical missing keywords")
         
-        if optimized_ats.skills_analysis.skills_alignment_score > original_ats.skills_analysis.skills_alignment_score:
-            improvements_made.append("Enhanced skills alignment with job requirements")
+        # if optimized_ats.skills_analysis.skills_alignment_score > original_ats.skills_analysis.skills_alignment_score:
+        #     improvements_made.append("Enhanced skills alignment with job requirements")
         
         return JSONResponse(
             status_code=200,
