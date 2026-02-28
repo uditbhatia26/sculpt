@@ -1,11 +1,35 @@
-myenv
-.env
+# Python
 __pycache__/
-exp.ipynb
 *.pyc
-.DS_Store
-data.json
-*.pdf
-*.yaml
-debug*/
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environment
+.venv/
+myenv/
+venv/
+env/
+
+# Environment & secrets
+.env
+config/.env
+
+# Runtime outputs (generated at runtime, not for source control)
+app.log
 *.log
+debug_resumes/
+optimized_resumes/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+*.pdf
+exp.ipynb
+.python-version
