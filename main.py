@@ -174,7 +174,7 @@ def create_user(credentials: UserSignup, db: Session = Depends(get_db)):
         data={"sub": str(new_user.id)},
         expires_delta=timedelta(days=7)
     )
-    logger.info(f"✅ User created: {new_user.email}")
+    logger.info(f"[OK] User created: {new_user.email}")
     return build_auth_response(new_user, access_token, db)
 
 
@@ -191,7 +191,7 @@ def login_user(credentials: UserLogin, db: Session = Depends(get_db)):
         data={"sub": str(user.id)},
         expires_delta=timedelta(days=7)
     )
-    logger.info(f"✅ User logged in: {user.email}")
+    logger.info(f"[OK] User logged in: {user.email}")
     return build_auth_response(user, access_token, db)
 
 
@@ -283,7 +283,7 @@ async def upload_resume(
     db.commit()
     db.refresh(current_user)
 
-    logger.info(f"✅ Resume processed for {current_user.email}")
+    logger.info(f"[OK] Resume processed for {current_user.email}")
     return {
         "message":  "Resume uploaded and parsed successfully",
         "filename": file.filename,
@@ -415,7 +415,7 @@ async def optimize_resume_endpoint(
         db.commit()
 
         weekly_limit = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
-        logger.info(f"✅ Optimization complete for {current_user.email}. Weekly usage: {new_count}/{weekly_limit}")
+        logger.info(f"[OK] Optimization complete for {current_user.email}. Weekly usage: {new_count}/{weekly_limit}")
 
         return {
             "message":                    "Resume optimized successfully",
