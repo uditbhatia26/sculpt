@@ -4,7 +4,7 @@ Creates all tables in the Supabase PostgreSQL database
 """
 
 from config.database import engine, Base, test_connection
-from models.database_models import User, OptimizedResume, GenerationUsage
+from models.database_models import User, OptimizedResume, GenerationUsage, ParsedJDCache
 import logging
 from dotenv import load_dotenv
 load_dotenv()
@@ -27,6 +27,7 @@ def init_database():
         logger.info("   - users               (auth + resume storage)")
         logger.info("   - optimized_resumes   (generation history)")
         logger.info("   - generation_usage    (weekly paywall tracking)")
+        logger.info("   - parsed_jd_cache     (LLM JD parse cache)")
         return True
     except Exception as e:
         logger.error(f"[ERROR] Failed to create tables: {e}")
