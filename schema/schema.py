@@ -52,7 +52,8 @@ class parsedJobDescription(BaseModel):
 # ==================== ATS SCORING SCHEMAS ====================
 
 class CalculateATS(BaseModel):
-    job_desc: Annotated[str, Field(..., description="Job Description provided by the user")]
+    job_desc:     Annotated[str, Field(..., description="Job Description provided by the user")]
+    jd_cache_id:  Optional[str] = Field(None, description="ID of a previously parsed and cached JD. If provided the LLM parse step is skipped.")
 
 
 class ATS(BaseModel):
@@ -118,7 +119,9 @@ class DetailedATS(BaseModel):
 # ==================== OPTIMIZATION REQUEST SCHEMAS ====================
 
 class OptimizeResumeRequest(BaseModel):
-    job_desc: Annotated[str, Field(..., description="Job Description provided by the user")]
+    job_desc:           Annotated[str, Field(..., description="Job Description provided by the user")]
+    jd_cache_id:        Optional[str]   = Field(None,  description="ID of a previously parsed and cached JD. If provided, the LLM JD parse step is skipped.")
+    original_ats_score: Optional[float] = Field(None,  description="ATS score already computed by /calculate-ats-detailed. If provided, the original ATS LLM call is skipped.")
 
 
 class OptimizedResumeResponse(BaseModel):

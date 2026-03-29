@@ -64,3 +64,17 @@ class GenerationUsage(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "week_start", name="uq_generation_usage_user_week"),
     )
+
+
+class ParsedJDCache(Base):
+    """Caches parsed job descriptions keyed by a SHA-256 hash of the raw JD text.
+    Prevents duplicate LLM calls when the same JD is used across Analyze + Generate.
+    """
+    __tablename__ = "parsed_jd_cache"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    jd_hash     = Column(String(64), unique=True, nullable=False, index=True)  # SHA-256 hex digest
+    job_title   = Column(String, nullable=True)
+    skills      = Column(JSONB, nullable=False)      # List[str]
+    job_description = Column(Text, nullable=False)   # Cleaned/condensed JD text from LLM
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())

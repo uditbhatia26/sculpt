@@ -14,13 +14,14 @@ from config.auth import (
     authenticate_user,
     get_current_user
 )
-from models.database_models import User, OptimizedResume, GenerationUsage
+from models.database_models import User, OptimizedResume, GenerationUsage, ParsedJDCache
 from io import BytesIO
 from config.resume_functions import ats_detailed, optimize_resume, parse_jd
 from models.chains import llm, res2yaml_chain
 import yaml
 from datetime import datetime, timedelta, date
 import os
+import hashlib
 from PyPDF2 import PdfReader
 import logging
 import uuid
@@ -98,6 +99,48 @@ def check_generation_limit(user: User, db: Session):
         )
 
 
+def jd_hash(raw_jd: str) -> str:
+    """Return a SHA-256 hex digest of the raw job description (stripped + lowercased)."""
+    return hashlib.sha256(raw_jd.strip().lower().encode("utf-8")).hexdigest()
+
+
+async def get_or_parse_jd(raw_jd: str, db: Session):
+    """Return a cached parsedJobDescription for this JD, calling the LLM only on a cache miss.
+    
+    Returns:
+        tuple[parsedJobDescription, str]: (parsed_jd object, cache_id string)
+    """
+    digest = jd_hash(raw_jd)
+
+    # --- Cache hit ---
+    cached = db.query(ParsedJDCache).filter(ParsedJDCache.jd_hash == digest).first()
+    if cached:
+        logger.info(f"[CACHE HIT] JD parse cache hit for hash {digest[:12]}...")
+        from schema.schema import parsedJobDescription
+        parsed = parsedJobDescription(
+            job_title=cached.job_title or "",
+            skills=cached.skills or [],
+            job_description=cached.job_description,
+        )
+        return parsed, str(cached.id)
+
+    # --- Cache miss — call LLM ---
+    logger.info(f"[CACHE MISS] Parsing JD via LLM for hash {digest[:12]}...")
+    parsed = await parse_jd(job_description=raw_jd)
+
+    record = ParsedJDCache(
+        id=uuid.uuid4(),
+        jd_hash=digest,
+        job_title=parsed.job_title,
+        skills=parsed.skills,
+        job_description=parsed.job_description,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return parsed, str(record.id)
+
+
 def build_auth_response(user: User, access_token: str, db: Session) -> AuthResponse:
     """Build a consistent AuthResponse including paywall fields."""
     weekly_usage = get_weekly_usage(user.id, db)
@@ -146,6 +189,28 @@ def home():
 @app.get("/health")
 def health():
     return {"status": "OK", "model_loaded": llm is not None}
+
+
+# ==================== JD PARSING ENDPOINT ====================
+
+@app.post('/parse-jd')
+async def parse_job_description(
+    request: CalculateATS,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Parse and cache a job description. Returns a jd_cache_id the client should
+    pass to /calculate-ats-detailed and /optimize-resume to skip repeated LLM parsing."""
+    if not request.job_desc.strip():
+        raise HTTPException(status_code=400, detail="Job description cannot be empty.")
+
+    parsed, cache_id = await get_or_parse_jd(request.job_desc, db)
+    logger.info(f"JD parsed/cached for {current_user.email}: cache_id={cache_id}")
+    return {
+        "jd_cache_id": cache_id,
+        "job_title":   parsed.job_title,
+        "skills":      parsed.skills,
+    }
 
 
 # ==================== AUTHENTICATION ENDPOINTS ====================
@@ -313,7 +378,11 @@ async def calculate_ats_detailed(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Calculate a detailed ATS score for the user's resume against a job description."""
+    """Calculate a detailed ATS score for the user's resume against a job description.
+    
+    If `jd_cache_id` is provided in the request body, the pre-parsed JD is reused
+    from DB and no LLM parse call is made.
+    """
     logger.info(f"ATS calculation for user: {current_user.email}")
 
     if not request.job_desc.strip():
@@ -322,7 +391,24 @@ async def calculate_ats_detailed(
     if not current_user.resume_yaml:
         raise HTTPException(status_code=404, detail="No resume found. Please upload a resume first.")
 
-    parsed_jd = await parse_jd(job_description=request.job_desc)
+    # Use cached parse if the client provided a jd_cache_id
+    if request.jd_cache_id:
+        cached = db.query(ParsedJDCache).filter(
+            ParsedJDCache.id == request.jd_cache_id
+        ).first()
+        if cached:
+            from schema.schema import parsedJobDescription
+            parsed_jd = parsedJobDescription(
+                job_title=cached.job_title or "",
+                skills=cached.skills or [],
+                job_description=cached.job_description,
+            )
+            logger.info(f"[CACHE HIT] Reused parsed JD for ATS (cache_id={request.jd_cache_id})")
+        else:
+            logger.warning(f"jd_cache_id {request.jd_cache_id} not found — falling back to live parse")
+            parsed_jd, _ = await get_or_parse_jd(request.job_desc, db)
+    else:
+        parsed_jd, _ = await get_or_parse_jd(request.job_desc, db)
 
     try:
         result = await ats_detailed(current_user.resume_yaml, parsed_jd)
@@ -341,6 +427,10 @@ async def optimize_resume_endpoint(
 ):
     """
     Optimize resume for a job description.
+    
+    Accepts optional `jd_cache_id` (skip LLM JD parse) and `original_ats_score`
+    (skip re-running the original ATS calculation — already done by /calculate-ats-detailed).
+    
     Enforces weekly generation limits based on the user's plan:
       - free: 5 generations / week
       - pro:  30 generations / week
@@ -356,14 +446,38 @@ async def optimize_resume_endpoint(
     # ---- Paywall check ----
     check_generation_limit(current_user, db)
 
-    parsed_jd = await parse_jd(job_description=request.job_desc)
+    # ---- Resolve parsed JD (cache-first) ----
+    if request.jd_cache_id:
+        cached = db.query(ParsedJDCache).filter(
+            ParsedJDCache.id == request.jd_cache_id
+        ).first()
+        if cached:
+            from schema.schema import parsedJobDescription
+            parsed_jd = parsedJobDescription(
+                job_title=cached.job_title or "",
+                skills=cached.skills or [],
+                job_description=cached.job_description,
+            )
+            logger.info(f"[CACHE HIT] Reused parsed JD for optimize (cache_id={request.jd_cache_id})")
+        else:
+            logger.warning(f"jd_cache_id {request.jd_cache_id} not found — falling back to live parse")
+            parsed_jd, _ = await get_or_parse_jd(request.job_desc, db)
+    else:
+        parsed_jd, _ = await get_or_parse_jd(request.job_desc, db)
 
     try:
-        # Score the original resume
-        original_ats = await ats_detailed(current_user.resume_yaml, parsed_jd)
-        logger.info(f"Original ATS for {current_user.email}: {original_ats.overall_score}")
+        # ---- Original ATS score (skip if already computed by the Analyze step) ----
+        if request.original_ats_score is not None:
+            logger.info(f"Using pre-computed original ATS score: {request.original_ats_score} for {current_user.email}")
+            # Build a minimal object so we can still compute keywords_added diff
+            original_ats = None
+            original_score_value = request.original_ats_score
+        else:
+            original_ats = await ats_detailed(current_user.resume_yaml, parsed_jd)
+            original_score_value = original_ats.overall_score
+            logger.info(f"Original ATS for {current_user.email}: {original_score_value}")
 
-        # Generate the optimized version
+        # ---- Generate the optimized resume ----
         optimized_yaml = await optimize_resume(
             resume_content=current_user.resume_yaml,
             job_description=parsed_jd,
@@ -375,14 +489,22 @@ async def optimize_resume_endpoint(
             optimized_yaml = optimized_yaml.split("```yaml")[-1] if "```yaml" in optimized_yaml else optimized_yaml.split("```")[-1]
             optimized_yaml = optimized_yaml.split("```")[0].strip()
 
-        # Score the optimized resume
+        # ---- Score the optimized resume ----
         optimized_ats = await ats_detailed(optimized_yaml, parsed_jd)
         logger.info(f"Optimized ATS for {current_user.email}: {optimized_ats.overall_score}")
 
-        # Build improvement metadata
-        keywords_added    = list(set(optimized_ats.keyword_analysis.matched_keywords) - set(original_ats.keyword_analysis.matched_keywords))
+        # ---- Build improvement metadata ----
+        if original_ats is not None:
+            keywords_added = list(
+                set(optimized_ats.keyword_analysis.matched_keywords) -
+                set(original_ats.keyword_analysis.matched_keywords)
+            )
+        else:
+            # We didn't re-run the original ATS — diff is unavailable, return empty list
+            keywords_added = []
+
         improvements_made = [
-            f"Score improved from {original_ats.overall_score:.1f} to {optimized_ats.overall_score:.1f}",
+            f"Score improved from {original_score_value:.1f} to {optimized_ats.overall_score:.1f}",
             f"Added {len(keywords_added)} new matching keywords",
         ]
 
@@ -400,9 +522,9 @@ async def optimize_resume_endpoint(
             user_id=current_user.id,
             job_description=request.job_desc,
             job_title=parsed_jd.job_title,
-            original_ats_score=original_ats.overall_score,
+            original_ats_score=original_score_value,
             optimized_ats_score=optimized_ats.overall_score,
-            score_improvement=optimized_ats.overall_score - original_ats.overall_score,
+            score_improvement=optimized_ats.overall_score - original_score_value,
             match_level=optimized_ats.match_level,
             optimized_yaml=optimized_yaml,
             keywords_added=keywords_added,
@@ -419,9 +541,9 @@ async def optimize_resume_endpoint(
 
         return {
             "message":                    "Resume optimized successfully",
-            "original_score":             round(original_ats.overall_score, 2),
+            "original_score":             round(original_score_value, 2),
             "optimized_score":            round(optimized_ats.overall_score, 2),
-            "score_improvement":          round(optimized_ats.overall_score - original_ats.overall_score, 2),
+            "score_improvement":          round(optimized_ats.overall_score - original_score_value, 2),
             "match_level":                optimized_ats.match_level,
             "improvements_made":          improvements_made,
             "keywords_added":             keywords_added,
