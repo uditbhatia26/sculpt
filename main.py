@@ -1,10 +1,11 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from schema.schema import (
     UserLogin, UserSignup, CalculateATS, AuthResponse,
-    DetailedATS, OptimizeResumeRequest
+    DetailedATS, OptimizeResumeRequest, GeneratePDFRequest
 )
 from dotenv import load_dotenv
 from config.database import get_db, test_connection
@@ -15,6 +16,7 @@ from config.auth import (
     get_current_user
 )
 from models.database_models import User, OptimizedResume, GenerationUsage, ParsedJDCache
+from config.pdf_generator import generate_pdf_from_yaml_string
 from io import BytesIO
 from config.resume_functions import ats_detailed, optimize_resume, parse_jd
 from models.chains import llm, res2yaml_chain
@@ -172,10 +174,14 @@ async def startup_event():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8000", "chrome-extension://*"],
+    allow_origins=[
+        "http://localhost:8000",
+        "http://localhost:3000",
+        "chrome-extension://*",   # Chrome extensions (MV3) — narrow to specific IDs before marketplace release
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -293,25 +299,42 @@ async def upload_resume(
     """Upload and parse user's resume. Replaces any previously uploaded resume."""
     logger.info(f"Resume upload for user: {current_user.email}")
 
-    # Validate file type
+    # Validate file type via content-type header
     if file.content_type != "application/pdf":
         raise HTTPException(
             status_code=400,
             detail=f"Only PDF files are allowed. Got: {file.content_type}"
         )
 
-    # Validate file size (2 MB limit)
-    if file.size and (int(file.size) / 1_048_576) > 2:
+    # Validate file size (2 MB limit) — checked from header first (fast path)
+    PDF_MAX_BYTES = 2 * 1_048_576  # 2 MB
+    if file.size and int(file.size) > PDF_MAX_BYTES:
         raise HTTPException(
             status_code=400,
-            detail=f"File too large. Maximum 2 MB allowed. Got: {(int(file.size) / 1_048_576):.2f} MB"
+            detail=f"File too large. Maximum 2 MB allowed."
         )
 
     # Extract text from PDF
     try:
         pdf_bytes = await file.read()
+
+        # Re-check size after read (content-type / size header can be spoofed)
+        if len(pdf_bytes) > PDF_MAX_BYTES:
+            raise HTTPException(status_code=400, detail="File too large. Maximum 2 MB allowed.")
+
+        # Magic-byte check — PDFs always start with "%PDF"
+        if not pdf_bytes.startswith(b"%PDF"):
+            raise HTTPException(status_code=400, detail="Invalid file: not a PDF.")
+
         reader = PdfReader(BytesIO(pdf_bytes))
+
+        # Guard against malformed / adversarial PDFs with absurd page counts
+        if len(reader.pages) > 50:
+            raise HTTPException(status_code=400, detail="PDF has too many pages (max 50).")
+
         resume_content = "".join(page.extract_text() or "" for page in reader.pages)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"PDF read error for {current_user.id}: {e}")
         raise HTTPException(status_code=400, detail="Failed to read PDF. It may be corrupted or password-protected.")
@@ -416,7 +439,7 @@ async def calculate_ats_detailed(
         return result
     except Exception as e:
         logger.error(f"ATS error for {current_user.id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Unable to calculate ATS: {e}")
+        raise HTTPException(status_code=500, detail="Unable to calculate ATS score. Please try again.")
 
 
 @app.post('/optimize-resume')
@@ -557,7 +580,7 @@ async def optimize_resume_endpoint(
         raise
     except Exception as e:
         logger.error(f"Optimization error for {current_user.id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Unable to optimize resume: {e}")
+        raise HTTPException(status_code=500, detail="Unable to optimize resume. Please try again.")
 
 
 # ==================== HISTORY ENDPOINT ====================
@@ -588,3 +611,53 @@ async def get_my_optimizations(
         }
         for r in records
     ]
+
+
+# ==================== PDF GENERATION ENDPOINT ====================
+
+@app.post('/generate-pdf')
+async def generate_pdf_endpoint(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    body: GeneratePDFRequest = None,
+):
+    """
+    Generate a PDF from a resume YAML string and stream it back.
+
+    Body (optional JSON):
+        { "resume_yaml": "<yaml string>" }
+
+    If resume_yaml is omitted, the user's stored base resume is used.
+    """
+    # Resolve which YAML to render
+    resume_yaml = None
+    if body and body.resume_yaml:
+        resume_yaml = body.resume_yaml
+
+    if not resume_yaml:
+        resume_yaml = current_user.resume_yaml
+
+
+    if not resume_yaml:
+        raise HTTPException(
+            status_code=404,
+            detail="No resume found. Please upload a resume first."
+        )
+
+    try:
+        pdf_bytes = generate_pdf_from_yaml_string(resume_yaml)
+    except Exception as e:
+        logger.error(f"PDF generation error for {current_user.id}: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
+
+    logger.info(f"[OK] PDF generated for {current_user.email} ({len(pdf_bytes):,} bytes)")
+
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": 'attachment; filename="optimized_resume.pdf"',
+            "Content-Length": str(len(pdf_bytes)),
+        },
+    )
+

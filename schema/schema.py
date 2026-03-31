@@ -7,8 +7,8 @@ from uuid import UUID
 
 class UserSignup(BaseModel):
     email:       Annotated[EmailStr, Field(..., description="Email of the user")]
-    password:    Annotated[str,      Field(..., description="User's password", min_length=6)]
-    full_name:   Annotated[Optional[str], Field(None, description="User's full name")]
+    password:    Annotated[str,      Field(..., description="User's password", min_length=6, max_length=128)]
+    full_name:   Annotated[Optional[str], Field(None, description="User's full name", max_length=120)]
 
 
 class UserLogin(BaseModel):
@@ -52,7 +52,7 @@ class parsedJobDescription(BaseModel):
 # ==================== ATS SCORING SCHEMAS ====================
 
 class CalculateATS(BaseModel):
-    job_desc:     Annotated[str, Field(..., description="Job Description provided by the user")]
+    job_desc:     Annotated[str, Field(..., description="Job Description provided by the user", min_length=50, max_length=20_000)]
     jd_cache_id:  Optional[str] = Field(None, description="ID of a previously parsed and cached JD. If provided the LLM parse step is skipped.")
 
 
@@ -119,9 +119,9 @@ class DetailedATS(BaseModel):
 # ==================== OPTIMIZATION REQUEST SCHEMAS ====================
 
 class OptimizeResumeRequest(BaseModel):
-    job_desc:           Annotated[str, Field(..., description="Job Description provided by the user")]
+    job_desc:           Annotated[str, Field(..., description="Job Description provided by the user", min_length=50, max_length=20_000)]
     jd_cache_id:        Optional[str]   = Field(None,  description="ID of a previously parsed and cached JD. If provided, the LLM JD parse step is skipped.")
-    original_ats_score: Optional[float] = Field(None,  description="ATS score already computed by /calculate-ats-detailed. If provided, the original ATS LLM call is skipped.")
+    original_ats_score: Optional[float] = Field(None,  description="ATS score already computed by /calculate-ats-detailed. If provided, the original ATS LLM call is skipped.", ge=0, le=100)
 
 
 class OptimizedResumeResponse(BaseModel):
@@ -134,3 +134,13 @@ class OptimizedResumeResponse(BaseModel):
     match_level:           str       = Field(description="Excellent/Good/Fair/Poor")
     weekly_usage:          int       = Field(description="Generations used this week after this call")
     weekly_limit:          int       = Field(description="Total allowed generations per week")
+
+
+# ==================== PDF GENERATION SCHEMAS ====================
+
+class GeneratePDFRequest(BaseModel):
+    resume_yaml: Optional[str] = Field(
+        None,
+        description="YAML string of the resume to render. If omitted, the user's stored base resume is used.",
+        max_length=100_000,
+    )

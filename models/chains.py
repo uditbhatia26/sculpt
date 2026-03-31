@@ -26,10 +26,10 @@ prompt = ChatPromptTemplate(
         ('human', "{resume_content}")
     ]
 )
-res2yaml_chain = prompt | llm
+res2yaml_chain = prompt | openai_llm
 
 # Parsing the Job description
-jd_parser_llm = llm.with_structured_output(parsedJobDescription)
+jd_parser_llm = openai_llm.with_structured_output(parsedJobDescription)
 jd_prompt = PromptTemplate(
     template=jd_template,
     input_variables=['job_description']
@@ -37,7 +37,7 @@ jd_prompt = PromptTemplate(
 jd_parser_chain = jd_prompt | jd_parser_llm
 
 # OLD ATS Calculation (Keep for backward compatibility)
-ats_calulcation_llm = llm.with_structured_output(ATS)
+ats_calulcation_llm = openai_llm.with_structured_output(ATS)
 ats_prompt = PromptTemplate(
     template=ats_calculation,
     input_variables=['job_title', 'skills', 'job_description', 'resume_yaml'],
@@ -45,7 +45,7 @@ ats_prompt = PromptTemplate(
 ats_chain = ats_prompt | ats_calulcation_llm
 
 # NEW Enhanced ATS Calculation with detailed breakdown
-enhanced_ats_llm = llm.with_structured_output(DetailedATS)
+enhanced_ats_llm = openai_llm.with_structured_output(DetailedATS)
 enhanced_ats_prompt = ChatPromptTemplate(
     [
         ('system', ENHANCED_ATS_SYSTEM_PROMPT),
@@ -61,4 +61,4 @@ optimization_prompt = ChatPromptTemplate(
         ('human', OPTIMIZATION_HUMAN_TEMPLATE)
     ]
 )
-optimization_chain = optimization_prompt | llm
+optimization_chain = optimization_prompt | openai_llm
