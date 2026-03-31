@@ -131,6 +131,7 @@ dependencies = [
     "rapidocr==3.4.2",
     "referencing==0.37.0",
     "regex==2025.11.3",
+    "reportlab>=4.4.10",
     "requests==2.32.5",
     "requests-toolbelt==1.0.0",
     "rich==14.2.0",
