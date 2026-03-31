@@ -20,6 +20,7 @@ app.log
 *.log
 debug_resumes/
 optimized_resumes/
+uv.lock
 
 # OS
 .DS_Store
