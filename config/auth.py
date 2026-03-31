@@ -13,7 +13,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # JWT Configuration
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-this-in-production")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    import warnings
+    warnings.warn(
+        "JWT_SECRET_KEY is not set. Using an insecure fallback — set this env var before deploying!",
+        stacklevel=1,
+    )
+    SECRET_KEY = "insecure-dev-key-change-before-deploying"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
