@@ -156,7 +156,10 @@ def compute_resume_diff(original_yaml: str, optimized_yaml: str) -> list:
             opti_entry   = opti_exp[company]
             orig_bullets = set(orig_entry.get("achievements") or [])
             opti_bullets = set(opti_entry.get("achievements") or [])
-            changed      = len(orig_bullets.symmetric_difference(opti_bullets))
+            # Each changed bullet appears twice in the symmetric difference
+            # (once as the removed original, once as the added enhanced version),
+            # so divide by 2 to get the real count of enhanced bullets.
+            changed = len(orig_bullets.symmetric_difference(opti_bullets)) // 2
             if changed:
                 changes.append({"severity": "positive", "label": f"{changed} bullet(s) enhanced at {company}", "items": None})
         for company in opti_exp:
