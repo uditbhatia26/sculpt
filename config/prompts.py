@@ -397,6 +397,14 @@ STRICT CONSTRAINTS:
    - Achievements that didn't happen
    - Companies or roles you didn't have
 
+🔒 EDUCATION IS IMMUTABLE — THIS IS A HARD RULE:
+   - Copy the education section from the original resume EXACTLY as-is
+   - DO NOT change institution names, degree names, majors, CGPA/GPA, dates, or any other field
+   - DO NOT add, remove, or reorder education entries
+   - DO NOT embellish or reword any education details
+   - Education optimization is STRICTLY FORBIDDEN
+   - If you modify education in any way, the output will be rejected
+
 ✅ ALLOWED ENHANCEMENTS:
    - Stronger action verbs
    - More specific descriptions
@@ -436,6 +444,9 @@ Generate an optimized resume that:
 3. Enhances bullets with metrics and impact
 4. Smartly incorporates relevant addons
 5. Maintains 100% truthfulness
+6. Copies the education section VERBATIM from the original resume — zero changes allowed
+
+IMPORTANT REMINDER: The education section must be reproduced character-for-character from the original resume. Any deviation is a critical error.
 
 Output ONLY the optimized resume in clean YAML format. No markdown, no explanations.
 """
