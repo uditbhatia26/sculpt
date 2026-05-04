@@ -101,6 +101,26 @@ def check_generation_limit(user: User, db: Session):
         )
 
 
+def get_daily_usage(user_id, db: Session) -> int:
+    """Count resume generations made today (UTC)."""
+    today_start = datetime.combine(date.today(), datetime.min.time())
+    today_end   = today_start + timedelta(days=1)
+    return db.query(OptimizedResume).filter(
+        OptimizedResume.user_id == user_id,
+        OptimizedResume.created_at >= today_start,
+        OptimizedResume.created_at <  today_end,
+    ).count()
+
+
+def get_monthly_usage(user_id, db: Session) -> int:
+    """Count resume generations made this calendar month (UTC)."""
+    month_start = datetime.combine(date.today().replace(day=1), datetime.min.time())
+    return db.query(OptimizedResume).filter(
+        OptimizedResume.user_id == user_id,
+        OptimizedResume.created_at >= month_start,
+    ).count()
+
+
 def compute_resume_diff(original_yaml: str, optimized_yaml: str) -> list:
     """Semantic diff between original and optimized resume YAMLs.
 
@@ -244,8 +264,10 @@ async def get_or_parse_jd(raw_jd: str, db: Session):
 
 def build_auth_response(user: User, access_token: str, db: Session) -> AuthResponse:
     """Build a consistent AuthResponse including paywall fields."""
-    weekly_usage = get_weekly_usage(user.id, db)
-    weekly_limit = PLAN_LIMITS.get(user.plan, PLAN_LIMITS["free"])
+    weekly_usage  = get_weekly_usage(user.id, db)
+    weekly_limit  = PLAN_LIMITS.get(user.plan, PLAN_LIMITS["free"])
+    daily_usage   = get_daily_usage(user.id, db)
+    monthly_usage = get_monthly_usage(user.id, db)
     return AuthResponse(
         access_token=access_token,
         token_type="bearer",
@@ -256,6 +278,8 @@ def build_auth_response(user: User, access_token: str, db: Session) -> AuthRespo
         has_resume=bool(user.resume_yaml),
         weekly_usage=weekly_usage,
         weekly_limit=weekly_limit,
+        daily_usage=daily_usage,
+        monthly_usage=monthly_usage,
     )
 
 
@@ -371,8 +395,10 @@ def get_current_user_profile(
     db: Session = Depends(get_db)
 ):
     """Get current authenticated user's profile including paywall status."""
-    weekly_usage = get_weekly_usage(current_user.id, db)
-    weekly_limit = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
+    weekly_usage  = get_weekly_usage(current_user.id, db)
+    weekly_limit  = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
+    daily_usage   = get_daily_usage(current_user.id, db)
+    monthly_usage = get_monthly_usage(current_user.id, db)
     return {
         "user_id":            str(current_user.id),
         "email":              current_user.email,
@@ -383,6 +409,8 @@ def get_current_user_profile(
         "resume_uploaded_at": current_user.resume_uploaded_at.isoformat() if current_user.resume_uploaded_at else None,
         "weekly_usage":       weekly_usage,
         "weekly_limit":       weekly_limit,
+        "daily_usage":        daily_usage,
+        "monthly_usage":      monthly_usage,
         "created_at":         current_user.created_at.isoformat() if current_user.created_at else None,
     }
 
@@ -664,6 +692,10 @@ async def optimize_resume_endpoint(
         # ---- Compute changelog diff ----
         resume_changes = compute_resume_diff(current_user.resume_yaml, optimized_yaml)
 
+        # ---- Usage stats for the meter ----
+        daily_usage   = get_daily_usage(current_user.id, db)
+        monthly_usage = get_monthly_usage(current_user.id, db)
+
         return {
             "message":                    "Resume optimized successfully",
             "original_score":             round(original_score_value, 2),
@@ -677,6 +709,8 @@ async def optimize_resume_endpoint(
             "weekly_usage":               new_count,
             "weekly_limit":               weekly_limit,
             "resume_changes":             resume_changes,
+            "daily_usage":                daily_usage,
+            "monthly_usage":              monthly_usage,
         }
 
     except HTTPException:

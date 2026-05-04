@@ -26,6 +26,8 @@ class AuthResponse(BaseModel):
     has_resume:       bool          = Field(description="Whether the user has uploaded a resume")
     weekly_usage:     int           = Field(description="Generations used this week")
     weekly_limit:     int           = Field(description="Max generations allowed per week for their plan")
+    daily_usage:      int           = Field(default=0, description="Generations made today")
+    monthly_usage:    int           = Field(default=0, description="Generations made this calendar month")
 
 
 class UserProfile(BaseModel):
@@ -38,6 +40,8 @@ class UserProfile(BaseModel):
     resume_uploaded_at: Optional[str]
     weekly_usage:     int
     weekly_limit:     int
+    daily_usage:      int = 0
+    monthly_usage:    int = 0
     created_at:       str
 
 
