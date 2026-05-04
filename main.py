@@ -101,6 +101,102 @@ def check_generation_limit(user: User, db: Session):
         )
 
 
+def compute_resume_diff(original_yaml: str, optimized_yaml: str) -> list:
+    """Semantic diff between original and optimized resume YAMLs.
+
+    Returns a list of change dicts:
+        { "severity": "positive"|"info"|"critical", "label": str, "items": list[str]|None }
+    """
+    changes = []
+    try:
+        orig = yaml.safe_load(original_yaml) or {}
+        opti = yaml.safe_load(optimized_yaml) or {}
+        if not isinstance(orig, dict) or not isinstance(opti, dict):
+            return changes
+
+        # 1. Education guard
+        orig_edu = orig.get("education")
+        opti_edu = opti.get("education")
+        if orig_edu == opti_edu:
+            changes.append({"severity": "info", "label": "Education preserved exactly (no changes)", "items": None})
+        else:
+            changes.append({"severity": "critical", "label": "Education section was altered by the model", "items": None})
+
+        # 2. Skills diff
+        def flatten_skills(data: dict) -> set:
+            skills = set()
+            for v in data.values():
+                if isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, str):
+                            skills.add(item.lower())
+                elif isinstance(v, str):
+                    skills.add(v.lower())
+            return skills
+
+        orig_skills_section = orig.get("technical_skills") or {}
+        opti_skills_section = opti.get("technical_skills") or {}
+        if isinstance(orig_skills_section, dict) and isinstance(opti_skills_section, dict):
+            orig_skills = flatten_skills(orig_skills_section)
+            opti_skills = flatten_skills(opti_skills_section)
+            added   = sorted(opti_skills - orig_skills)
+            removed = sorted(orig_skills - opti_skills)
+            if added:
+                changes.append({"severity": "positive", "label": f"{len(added)} skill(s) added", "items": added})
+            if removed:
+                changes.append({"severity": "critical", "label": f"{len(removed)} skill(s) removed", "items": removed})
+
+        # 3. Experience bullets
+        orig_exp = {e.get("company", ""): e for e in (orig.get("experience") or []) if isinstance(e, dict)}
+        opti_exp = {e.get("company", ""): e for e in (opti.get("experience") or []) if isinstance(e, dict)}
+        for company, orig_entry in orig_exp.items():
+            if company not in opti_exp:
+                changes.append({"severity": "critical", "label": f"Experience entry removed: {company}", "items": None})
+                continue
+            opti_entry   = opti_exp[company]
+            orig_bullets = set(orig_entry.get("achievements") or [])
+            opti_bullets = set(opti_entry.get("achievements") or [])
+            changed      = len(orig_bullets.symmetric_difference(opti_bullets))
+            if changed:
+                changes.append({"severity": "positive", "label": f"{changed} bullet(s) enhanced at {company}", "items": None})
+        for company in opti_exp:
+            if company not in orig_exp:
+                changes.append({"severity": "info", "label": f"New experience entry added: {company}", "items": None})
+
+        # 4. Projects
+        orig_proj_names = {p.get("name", "") for p in (orig.get("projects") or []) if isinstance(p, dict)}
+        opti_proj_names = {p.get("name", "") for p in (opti.get("projects") or []) if isinstance(p, dict)}
+        added_projs   = sorted(opti_proj_names - orig_proj_names)
+        removed_projs = sorted(orig_proj_names - opti_proj_names)
+        if added_projs:
+            changes.append({"severity": "positive", "label": f"{len(added_projs)} project(s) added", "items": added_projs})
+        if removed_projs:
+            changes.append({"severity": "critical", "label": f"{len(removed_projs)} project(s) removed", "items": removed_projs})
+
+        # 5. Summary
+        if orig.get("summary") != opti.get("summary"):
+            if opti.get("summary") and not orig.get("summary"):
+                changes.append({"severity": "positive", "label": "Professional summary added", "items": None})
+            elif orig.get("summary") and not opti.get("summary"):
+                changes.append({"severity": "critical", "label": "Professional summary removed", "items": None})
+            else:
+                changes.append({"severity": "info", "label": "Professional summary rewritten", "items": None})
+
+        # 6. Top-level sections added / removed
+        SKIP = {"education", "technical_skills", "experience", "projects", "summary", "name", "contact"}
+        orig_sections = set(orig.keys()) - SKIP
+        opti_sections = set(opti.keys()) - SKIP
+        for s in sorted(opti_sections - orig_sections):
+            changes.append({"severity": "info", "label": f"New section added: {s.replace('_', ' ').title()}", "items": None})
+        for s in sorted(orig_sections - opti_sections):
+            changes.append({"severity": "critical", "label": f"Section removed: {s.replace('_', ' ').title()}", "items": None})
+
+    except Exception as e:
+        logger.warning(f"compute_resume_diff error (non-fatal): {e}")
+
+    return changes
+
+
 def jd_hash(raw_jd: str) -> str:
     """Return a SHA-256 hex digest of the raw job description (stripped + lowercased)."""
     return hashlib.sha256(raw_jd.strip().lower().encode("utf-8")).hexdigest()
@@ -562,6 +658,9 @@ async def optimize_resume_endpoint(
         weekly_limit = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
         logger.info(f"[OK] Optimization complete for {current_user.email}. Weekly usage: {new_count}/{weekly_limit}")
 
+        # ---- Compute changelog diff ----
+        resume_changes = compute_resume_diff(current_user.resume_yaml, optimized_yaml)
+
         return {
             "message":                    "Resume optimized successfully",
             "original_score":             round(original_score_value, 2),
@@ -574,6 +673,7 @@ async def optimize_resume_endpoint(
             "optimized_resume_yaml":      optimized_yaml,
             "weekly_usage":               new_count,
             "weekly_limit":               weekly_limit,
+            "resume_changes":             resume_changes,
         }
 
     except HTTPException:
