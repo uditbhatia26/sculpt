@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from sqlalchemy.orm import Session
 from schema.schema import (
     UserLogin, UserSignup, CalculateATS, AuthResponse,
@@ -42,12 +41,21 @@ load_dotenv()
 
 app = FastAPI(title="ResumeSculpt API", version="2.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.middleware("http")
+async def cors_middleware(request, call_next):
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin":  "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, *",
+                "Access-Control-Max-Age":        "86400",
+            },
+        )
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
 
 # ==================== PLAN LIMITS ====================
 PLAN_LIMITS = {
@@ -302,19 +310,7 @@ async def startup_event():
         logger.error("[WARN] Application started but database connection failed")
 
 
-# ==================== CORS ====================
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8000",
-        "http://localhost:3000",
-        "chrome-extension://*",   # Chrome extensions (MV3) — narrow to specific IDs before marketplace release
-    ],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
 
 
 # ==================== BASIC ENDPOINTS ====================
@@ -1045,4 +1041,4 @@ def admin_cleanup(
         "errors":        errors,
     }
 
-
+
