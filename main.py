@@ -42,6 +42,13 @@ load_dotenv()
 
 app = FastAPI(title="ResumeSculpt API", version="2.0.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ==================== PLAN LIMITS ====================
 PLAN_LIMITS = {
     "free": 5,
