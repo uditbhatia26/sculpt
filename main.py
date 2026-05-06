@@ -16,6 +16,7 @@ from config.auth import (
 )
 from models.database_models import User, OptimizedResume, GenerationUsage, ParsedJDCache
 from config.pdf_generator import generate_pdf_from_yaml_string
+from config.email import send_verification_email
 from io import BytesIO
 from config.resume_functions import ats_detailed, optimize_resume, parse_jd
 from models.chains import llm, res2yaml_chain
@@ -23,6 +24,7 @@ import yaml
 from datetime import datetime, timedelta, date
 import os
 import hashlib
+import secrets
 from PyPDF2 import PdfReader
 import logging
 import uuid
@@ -275,6 +277,7 @@ def build_auth_response(user: User, access_token: str, db: Session) -> AuthRespo
         full_name=user.full_name,
         plan=user.plan,
         has_resume=bool(user.resume_yaml),
+        email_verified=bool(user.email_verified),
         weekly_usage=weekly_usage,
         weekly_limit=weekly_limit,
         daily_usage=daily_usage,
@@ -345,12 +348,15 @@ async def parse_job_description(
 
 @app.post('/auth/signup', response_model=AuthResponse)
 def create_user(credentials: UserSignup, db: Session = Depends(get_db)):
-    """Create a new user account."""
+    """Create a new user account and send a verification email."""
     logger.info(f"Signup attempt for email: {credentials.email}")
 
     existing_user = db.query(User).filter(User.email == credentials.email).first()
     if existing_user:
         raise HTTPException(status_code=409, detail="User with this email already exists")
+
+    # Generate a secure one-time verification token
+    verification_token = secrets.token_urlsafe(32)
 
     new_user = User(
         id=uuid.uuid4(),
@@ -358,10 +364,19 @@ def create_user(credentials: UserSignup, db: Session = Depends(get_db)):
         password_hash=get_password_hash(credentials.password),
         full_name=credentials.full_name,
         plan="free",
+        email_verified=False,
+        email_verification_token=verification_token,
+        email_verification_sent_at=datetime.utcnow(),
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
+
+    # Send verification email (non-blocking — failure doesn't break signup)
+    try:
+        send_verification_email(new_user.email, new_user.full_name, verification_token)
+    except Exception as e:
+        logger.warning(f"[EMAIL] Verification email failed for {new_user.email}: {e}")
 
     access_token = create_access_token(
         data={"sub": str(new_user.id)},
@@ -406,12 +421,100 @@ def get_current_user_profile(
         "has_resume":         bool(current_user.resume_yaml),
         "resume_filename":    current_user.resume_filename,
         "resume_uploaded_at": current_user.resume_uploaded_at.isoformat() if current_user.resume_uploaded_at else None,
+        "email_verified":     bool(current_user.email_verified),
         "weekly_usage":       weekly_usage,
         "weekly_limit":       weekly_limit,
         "daily_usage":        daily_usage,
         "monthly_usage":      monthly_usage,
         "created_at":         current_user.created_at.isoformat() if current_user.created_at else None,
     }
+
+
+@app.get('/auth/verify-email')
+def verify_email(token: str, db: Session = Depends(get_db)):
+    """
+    Verify a user's email address using the one-time token sent on signup.
+    Token is valid for 24 hours.
+    """
+    if not token:
+        raise HTTPException(status_code=400, detail="Verification token is required.")
+
+    user = db.query(User).filter(User.email_verification_token == token).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification link.")
+
+    # Check 24-hour expiry
+    if user.email_verification_sent_at:
+        age = datetime.utcnow() - user.email_verification_sent_at.replace(tzinfo=None)
+        if age.total_seconds() > 86_400:  # 24 hours
+            raise HTTPException(
+                status_code=400,
+                detail="Verification link has expired. Please request a new one."
+            )
+
+    if user.email_verified:
+        return {"message": "Email already verified. You can close this page."}
+
+    user.email_verified             = True
+    user.email_verification_token   = None  # Invalidate token after use
+    db.commit()
+
+    logger.info(f"[OK] Email verified for {user.email}")
+    # Return a simple success page the browser can display
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"><title>Email Verified — ResumeSculpt</title></head>
+    <body style="font-family:'Segoe UI',Arial,sans-serif;background:#0f1117;
+                 display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+      <div style="background:#1a1d2e;border-radius:16px;padding:48px;text-align:center;max-width:420px;">
+        <div style="font-size:56px;">✅</div>
+        <h1 style="color:#e2e8f0;margin:16px 0 8px;">Email Verified!</h1>
+        <p style="color:#94a3b8;margin:0 0 32px;line-height:1.6;">
+          Your account is now fully active.<br>You can close this tab and return to the extension.
+        </p>
+        <a href="#" onclick="window.close()"
+           style="background:linear-gradient(135deg,#6c63ff,#a78bfa);
+                  color:#fff;padding:12px 28px;border-radius:8px;
+                  text-decoration:none;font-weight:600;">Close Tab</a>
+      </div>
+    </body>
+    </html>
+    """, status_code=200)
+
+
+@app.post('/auth/resend-verification')
+def resend_verification(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Resend the verification email. Rate-limited to once every 60 seconds."""
+    if current_user.email_verified:
+        raise HTTPException(status_code=400, detail="Your email is already verified.")
+
+    # Throttle: don't resend if last email was sent less than 60 seconds ago
+    if current_user.email_verification_sent_at:
+        age = datetime.utcnow() - current_user.email_verification_sent_at.replace(tzinfo=None)
+        if age.total_seconds() < 60:
+            wait = int(60 - age.total_seconds())
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {wait} seconds before requesting another email."
+            )
+
+    token = secrets.token_urlsafe(32)
+    current_user.email_verification_token   = token
+    current_user.email_verification_sent_at = datetime.utcnow()
+    db.commit()
+
+    try:
+        send_verification_email(current_user.email, current_user.full_name, token)
+    except Exception as e:
+        logger.error(f"[EMAIL] Resend failed for {current_user.email}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send verification email. Please try again.")
+
+    return {"message": "Verification email sent. Please check your inbox."}
 
 
 # ==================== RESUME MANAGEMENT ENDPOINTS ====================
@@ -424,6 +527,13 @@ async def upload_resume(
 ):
     """Upload and parse user's resume. Replaces any previously uploaded resume."""
     logger.info(f"Resume upload for user: {current_user.email}")
+
+    # Block unverified users from using LLM-backed features
+    if not current_user.email_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Please verify your email address before uploading a resume. Check your inbox for the verification link."
+        )
 
     # Validate file type via content-type header
     if file.content_type != "application/pdf":
@@ -535,6 +645,13 @@ async def calculate_ats_detailed(
     """
     logger.info(f"ATS calculation for user: {current_user.email}")
 
+    # Block unverified users
+    if not current_user.email_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Please verify your email address before using ATS analysis. Check your inbox for the verification link."
+        )
+
     if not request.job_desc.strip():
         raise HTTPException(status_code=400, detail="Job description cannot be empty.")
 
@@ -586,6 +703,13 @@ async def optimize_resume_endpoint(
       - pro:  30 generations / week
     """
     logger.info(f"Resume optimization for user: {current_user.email} (plan: {current_user.plan})")
+
+    # Block unverified users
+    if not current_user.email_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Please verify your email address before generating optimized resumes. Check your inbox for the verification link."
+        )
 
     if not request.job_desc.strip():
         raise HTTPException(status_code=400, detail="Job description cannot be empty.")

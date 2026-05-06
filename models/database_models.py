@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Text, Integer, Float, Date, UniqueConstraint, ForeignKey
+from sqlalchemy import Column, String, DateTime, Text, Integer, Float, Date, UniqueConstraint, ForeignKey, Boolean
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -15,6 +15,11 @@ class User(Base):
     full_name           = Column(String, nullable=True)
     plan                = Column(String, nullable=False, default="free")        # 'free' | 'pro'
 
+    # Email verification
+    email_verified              = Column(Boolean, nullable=False, default=False, server_default="false")
+    email_verification_token    = Column(String, nullable=True, index=True)      # One-time token sent in email
+    email_verification_sent_at  = Column(DateTime(timezone=True), nullable=True) # When last email was sent
+
     # Resume stored directly on the user (one active resume at a time)
     resume_yaml         = Column(Text, nullable=True)
     resume_filename     = Column(String, nullable=True)
@@ -26,6 +31,7 @@ class User(Base):
     # Relationships
     optimized_resumes   = relationship("OptimizedResume", back_populates="user", cascade="all, delete-orphan")
     generation_usage    = relationship("GenerationUsage",  back_populates="user", cascade="all, delete-orphan")
+
 
 
 class OptimizedResume(Base):
