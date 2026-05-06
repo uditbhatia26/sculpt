@@ -63,7 +63,7 @@ class CalculateATS(BaseModel):
 
 
 class ATS(BaseModel):
-    ats_score: Annotated[int, Field(..., description="ATS score of the resume according to the job description", gt=0, le=100)]
+    ats_score: Annotated[int, Field(..., description="ATS score of the resume according to the job description", ge=0, le=100)]
     reason:    Annotated[str, Field(description="Reason for the score")]
 
 
