@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException, File, UploadFile, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from schema.schema import (
     UserLogin, UserSignup, CalculateATS, AuthResponse,
     DetailedATS, OptimizeResumeRequest, GeneratePDFRequest
@@ -478,18 +477,19 @@ async def upload_resume(
         resume_yaml = resume_yaml.split("```yaml")[-1] if "```yaml" in resume_yaml else resume_yaml.split("```")[-1]
         resume_yaml = resume_yaml.split("```")[0].strip()
 
-    # Save debug copy locally
-    debug_folder = "debug_resumes"
-    os.makedirs(debug_folder, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_path = os.path.join(debug_folder, f"resume_{current_user.id}_{timestamp}.yaml")
-    try:
-        yaml_data = yaml.safe_load(resume_yaml)
-        with open(debug_path, 'w', encoding='utf-8') as f:
-            yaml.dump(yaml_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    except yaml.YAMLError:
-        with open(debug_path, 'w', encoding='utf-8') as f:
-            f.write(resume_yaml)
+    # Save debug copy locally (only when DEBUG_DUMP=true in .env)
+    if os.getenv("DEBUG_DUMP", "false").lower() == "true":
+        debug_folder = "debug_resumes"
+        os.makedirs(debug_folder, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_path = os.path.join(debug_folder, f"resume_{current_user.id}_{timestamp}.yaml")
+        try:
+            yaml_data = yaml.safe_load(resume_yaml)
+            with open(debug_path, 'w', encoding='utf-8') as f:
+                yaml.dump(yaml_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        except yaml.YAMLError:
+            with open(debug_path, 'w', encoding='utf-8') as f:
+                f.write(resume_yaml)
 
     # Store resume directly on the user record (replaces any previous resume)
     current_user.resume_yaml        = resume_yaml
@@ -658,13 +658,14 @@ async def optimize_resume_endpoint(
             f"Added {len(keywords_added)} new matching keywords",
         ]
 
-        # Save debug copy
-        folder = "optimized_resumes"
-        os.makedirs(folder, exist_ok=True)
-        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(folder, f"optimized_{current_user.id}_{ts}.yaml")
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(optimized_yaml)
+        # Save debug copy (only when DEBUG_DUMP=true in .env)
+        if os.getenv("DEBUG_DUMP", "false").lower() == "true":
+            folder = "optimized_resumes"
+            os.makedirs(folder, exist_ok=True)
+            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(folder, f"optimized_{current_user.id}_{ts}.yaml")
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(optimized_yaml)
 
         # Persist to database
         record = OptimizedResume(
@@ -797,4 +798,54 @@ async def generate_pdf_endpoint(
             "Content-Length": str(len(pdf_bytes)),
         },
     )
+
+
+# ==================== ADMIN ENDPOINTS ====================
+
+@app.delete("/admin/cleanup")
+def admin_cleanup(
+    token: str,
+    older_than_days: int = 7,
+):
+    """
+    Delete debug dump files older than `older_than_days` days from
+    `debug_resumes/` and `optimized_resumes/`.
+
+    Protected by a static secret token set via ADMIN_CLEANUP_TOKEN env var.
+    Only relevant when DEBUG_DUMP=true has been used to generate dump files.
+
+    Args:
+        token: Must match the ADMIN_CLEANUP_TOKEN environment variable.
+        older_than_days: Files older than this many days are deleted (default: 7).
+    """
+    expected = os.getenv("ADMIN_CLEANUP_TOKEN")
+    if not expected or token != expected:
+        raise HTTPException(status_code=403, detail="Invalid or missing cleanup token.")
+
+    if older_than_days < 1:
+        raise HTTPException(status_code=400, detail="older_than_days must be at least 1.")
+
+    cutoff = datetime.now().timestamp() - (older_than_days * 86_400)
+    deleted = []
+    errors  = []
+
+    for folder in ("debug_resumes", "optimized_resumes"):
+        if not os.path.isdir(folder):
+            continue
+        for fname in os.listdir(folder):
+            fpath = os.path.join(folder, fname)
+            try:
+                if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+                    deleted.append(f"{folder}/{fname}")
+            except Exception as e:
+                errors.append(f"{folder}/{fname}: {e}")
+
+    logger.info(f"[CLEANUP] Deleted {len(deleted)} debug file(s) older than {older_than_days}d. Errors: {len(errors)}")
+    return {
+        "deleted_count": len(deleted),
+        "deleted_files": deleted,
+        "errors":        errors,
+    }
+
 
