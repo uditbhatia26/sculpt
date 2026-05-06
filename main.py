@@ -430,6 +430,72 @@ def get_current_user_profile(
     }
 
 
+@app.post('/auth/google', response_model=AuthResponse)
+async def google_auth(payload: dict, db: Session = Depends(get_db)):
+    """
+    Verify a Google access token (from chrome.identity.getAuthToken) and
+    return a ResumeSculpt session JWT.
+    The extension sends: { access_token }
+    No client secret needed — Chrome Extension OAuth type handles auth on Google's side.
+    """
+    import httpx
+
+    google_access_token = payload.get("access_token")
+    if not google_access_token:
+        raise HTTPException(status_code=400, detail="access_token is required.")
+
+    # ── Step 1: Verify token and fetch user profile from Google ─────────────
+    async with httpx.AsyncClient() as client:
+        profile_res = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {google_access_token}"},
+        )
+
+    if profile_res.status_code != 200:
+        logger.error(f"[GOOGLE] Token verification failed: {profile_res.text}")
+        raise HTTPException(status_code=401, detail="Invalid or expired Google access token.")
+
+    profile         = profile_res.json()
+    google_email    = profile.get("email")
+    google_name     = profile.get("name")
+    google_verified = profile.get("verified_email", False)
+
+    if not google_email:
+        raise HTTPException(status_code=400, detail="Could not retrieve email from Google.")
+
+    # ── Step 2: Find or create user ─────────────────────────────────────────
+    user = db.query(User).filter(User.email == google_email).first()
+
+    if not user:
+        # New user — set a random unusable password (OAuth users sign in via Google)
+        user = User(
+            id=uuid.uuid4(),
+            email=google_email,
+            password_hash=get_password_hash(secrets.token_hex(32)),
+            full_name=google_name,
+            plan="free",
+            email_verified=google_verified,  # Google already verified their email
+            email_verification_token=None,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        logger.info(f"[GOOGLE] New user created via OAuth: {google_email}")
+    else:
+        # Existing user — sync verified status from Google if not already set
+        if google_verified and not user.email_verified:
+            user.email_verified = True
+            db.commit()
+        logger.info(f"[GOOGLE] Existing user signed in via OAuth: {google_email}")
+
+    # ── Step 3: Issue our own JWT ────────────────────────────────────────────
+    jwt_token = create_access_token(
+        data={"sub": str(user.id)},
+        expires_delta=timedelta(days=7)
+    )
+    return build_auth_response(user, jwt_token, db)
+
+
 @app.get('/auth/verify-email')
 def verify_email(token: str, db: Session = Depends(get_db)):
     """
