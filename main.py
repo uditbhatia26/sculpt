@@ -433,6 +433,41 @@ def get_current_user_profile(
     }
 
 
+@app.post('/auth/refresh', response_model=AuthResponse)
+def refresh_token(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Issue a fresh JWT for an authenticated user.
+    The existing token must still be valid (not expired).
+    Call proactively when < 24h remain to keep sessions alive.
+    """
+    weekly_usage  = get_weekly_usage(current_user.id, db)
+    weekly_limit  = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
+    daily_usage   = get_daily_usage(current_user.id, db)
+    monthly_usage = get_monthly_usage(current_user.id, db)
+
+    new_token = create_access_token(data={"sub": str(current_user.id)})
+    logger.info(f"[REFRESH] Token refreshed for {current_user.email}")
+
+    return {
+        "access_token":    new_token,
+        "token_type":      "bearer",
+        "user_id":         str(current_user.id),
+        "email":           current_user.email,
+        "full_name":       current_user.full_name,
+        "plan":            current_user.plan,
+        "has_resume":      bool(current_user.resume_yaml),
+        "resume_filename": current_user.resume_filename,
+        "email_verified":  bool(current_user.email_verified),
+        "weekly_usage":    weekly_usage,
+        "weekly_limit":    weekly_limit,
+        "daily_usage":     daily_usage,
+        "monthly_usage":   monthly_usage,
+    }
+
+
 @app.post('/auth/google', response_model=AuthResponse)
 async def google_auth(payload: dict, db: Session = Depends(get_db)):
     """
