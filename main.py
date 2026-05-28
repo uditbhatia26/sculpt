@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Depends
 from fastapi.responses import StreamingResponse, Response
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from schema.schema import (
     UserLogin, UserSignup, CalculateATS, AuthResponse,
     DetailedATS, OptimizeResumeRequest, GeneratePDFRequest
@@ -289,8 +290,27 @@ async def get_or_parse_jd(raw_jd: str, db: Session):
         job_description=parsed.job_description,
     )
     db.add(record)
-    db.commit()
-    db.refresh(record)
+    try:
+        db.commit()
+        db.refresh(record)
+    except IntegrityError:
+        # Another concurrent request inserted the same jd_hash between our
+        # cache-miss check and this INSERT (TOCTOU race). Roll back and use
+        # the row that the other request committed.
+        db.rollback()
+        cached = db.query(ParsedJDCache).filter(ParsedJDCache.jd_hash == digest).first()
+        if cached is None:
+            # Should never happen, but raise a clear error if it does
+            raise HTTPException(status_code=500, detail="JD cache write conflict; please retry.")
+        logger.info(f"[CACHE RACE] Resolved concurrent insert for hash {digest[:12]}...")
+        from schema.schema import parsedJobDescription
+        parsed = parsedJobDescription(
+            job_title=cached.job_title or "",
+            skills=cached.skills or [],
+            job_description=cached.job_description,
+        )
+        return parsed, str(cached.id)
+
     return parsed, str(record.id)
 
 
