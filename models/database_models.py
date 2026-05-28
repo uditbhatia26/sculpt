@@ -62,7 +62,7 @@ class GenerationUsage(Base):
     user_id     = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     week_start  = Column(Date, nullable=False)   # Monday of the ISO week, e.g. 2026-02-23
     count       = Column(Integer, nullable=False, default=0)
-    updated_at  = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_at  = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
     # Relationship
     user        = relationship("User", back_populates="generation_usage")

@@ -24,6 +24,7 @@ class AuthResponse(BaseModel):
     full_name:        Optional[str] = Field(description="User's full name")
     plan:             str           = Field(description="User plan: free or pro")
     has_resume:       bool          = Field(description="Whether the user has uploaded a resume")
+    resume_filename:  Optional[str] = Field(None, description="Filename of the user's current resume, if any")
     email_verified:   bool          = Field(default=False, description="Whether the user's email has been verified")
     weekly_usage:     int           = Field(description="Generations used this week")
     weekly_limit:     int           = Field(description="Max generations allowed per week for their plan")
