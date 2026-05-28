@@ -450,6 +450,31 @@ def get_current_user_profile(
     }
 
 
+@app.delete('/auth/me')
+def delete_account(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Permanently delete the authenticated user's account and all associated data.
+
+    Deletes:
+    - The user record itself
+    - All OptimizedResume rows (via CASCADE)
+    - All GenerationUsage rows (via CASCADE)
+
+    This action is irreversible (GDPR right to erasure).
+    """
+    masked = _mask_email(current_user.email)
+    logger.info(f"[DELETE ACCOUNT] Request for {masked}")
+
+    db.delete(current_user)
+    db.commit()
+
+    logger.info(f"[DELETE ACCOUNT] Account permanently deleted: {masked}")
+    return {"message": "Your account and all associated data have been permanently deleted."}
+
+
 @app.post('/auth/refresh', response_model=AuthResponse)
 def refresh_token(
     current_user: User = Depends(get_current_user),
