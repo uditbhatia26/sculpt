@@ -26,23 +26,33 @@ import hashlib
 import secrets
 from PyPDF2 import PdfReader
 import logging
+import logging.handlers
 import uuid
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("app.log", encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+def _mask_email(email: str) -> str:
+    """Mask an email address for safe logging: user@example.com → u***@example.com"""
+    try:
+        local, domain = email.split("@", 1)
+        return f"{local[0]}***@{domain}"
+    except Exception:
+        return "***"
+
+_log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+_rotating_handler = logging.handlers.RotatingFileHandler(
+    "app.log", maxBytes=10 * 1_048_576, backupCount=5, encoding="utf-8"
 )
+_rotating_handler.setFormatter(_log_formatter)
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(_log_formatter)
+
+logging.basicConfig(level=logging.INFO, handlers=[_rotating_handler, _stream_handler])
 logger = logging.getLogger("Sculpt")
 load_dotenv()
 
 app = FastAPI(title="ResumeSculpt API", version="2.0.0")
 
 @app.middleware("http")
-async def cors_middleware(request, call_next):
+async def cors_and_security_middleware(request, call_next):
     if request.method == "OPTIONS":
         return Response(
             status_code=200,
@@ -54,7 +64,13 @@ async def cors_middleware(request, call_next):
             },
         )
     response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    # Security headers (L3)
+    response.headers["X-Content-Type-Options"]       = "nosniff"
+    response.headers["X-Frame-Options"]              = "DENY"
+    response.headers["X-XSS-Protection"]             = "1; mode=block"
+    response.headers["Referrer-Policy"]              = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"]      = "default-src 'none'"
     return response
 
 # ==================== PLAN LIMITS ====================
@@ -292,6 +308,7 @@ def build_auth_response(user: User, access_token: str, db: Session) -> AuthRespo
         full_name=user.full_name,
         plan=user.plan,
         has_resume=bool(user.resume_yaml),
+        resume_filename=user.resume_filename,
         email_verified=bool(user.email_verified),
         weekly_usage=weekly_usage,
         weekly_limit=weekly_limit,
@@ -352,7 +369,7 @@ async def parse_job_description(
 @app.post('/auth/signup', response_model=AuthResponse)
 def create_user(credentials: UserSignup, db: Session = Depends(get_db)):
     """Create a new user account and send a verification email."""
-    logger.info(f"Signup attempt for email: {credentials.email}")
+    logger.info(f"Signup attempt for email: {_mask_email(credentials.email)}")
 
     existing_user = db.query(User).filter(User.email == credentials.email).first()
     if existing_user:
@@ -379,20 +396,20 @@ def create_user(credentials: UserSignup, db: Session = Depends(get_db)):
     try:
         send_verification_email(new_user.email, new_user.full_name, verification_token)
     except Exception as e:
-        logger.warning(f"[EMAIL] Verification email failed for {new_user.email}: {e}")
+        logger.warning(f"[EMAIL] Verification email failed for {_mask_email(new_user.email)}: {e}")
 
     access_token = create_access_token(
         data={"sub": str(new_user.id)},
-        expires_delta=timedelta(days=7)
+        expires_delta=timedelta(hours=24)
     )
-    logger.info(f"[OK] User created: {new_user.email}")
+    logger.info(f"[OK] User created: {_mask_email(new_user.email)}")
     return build_auth_response(new_user, access_token, db)
 
 
 @app.post('/auth/login', response_model=AuthResponse)
 def login_user(credentials: UserLogin, db: Session = Depends(get_db)):
     """Authenticate user and return JWT token."""
-    logger.info(f"Login attempt for: {credentials.email}")
+    logger.info(f"Login attempt for: {_mask_email(credentials.email)}")
 
     user = authenticate_user(db, credentials.email, credentials.password)
     if not user:
@@ -400,9 +417,9 @@ def login_user(credentials: UserLogin, db: Session = Depends(get_db)):
 
     access_token = create_access_token(
         data={"sub": str(user.id)},
-        expires_delta=timedelta(days=7)
+        expires_delta=timedelta(hours=24)
     )
-    logger.info(f"[OK] User logged in: {user.email}")
+    logger.info(f"[OK] User logged in: {_mask_email(user.email)}")
     return build_auth_response(user, access_token, db)
 
 
@@ -529,7 +546,7 @@ async def google_auth(payload: dict, db: Session = Depends(get_db)):
     # ── Step 3: Issue our own JWT ────────────────────────────────────────────
     jwt_token = create_access_token(
         data={"sub": str(user.id)},
-        expires_delta=timedelta(days=7)
+        expires_delta=timedelta(hours=24)
     )
     return build_auth_response(user, jwt_token, db)
 

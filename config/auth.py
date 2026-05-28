@@ -22,7 +22,7 @@ if not SECRET_KEY:
     )
     SECRET_KEY = "insecure-dev-key-change-before-deploying"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours — extension silently refreshes via /auth/refresh
 
 # Bearer token security
 security = HTTPBearer()
