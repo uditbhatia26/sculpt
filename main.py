@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Depends
+from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form
 from fastapi.responses import StreamingResponse, Response
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -756,10 +756,10 @@ def resend_verification(
 
 @app.post('/upload-resume')
 async def upload_resume(
-    file: UploadFile = File(..., description="Resume PDF file"),
-    ai_provider: str = None,
-    ai_api_key:  str = None,
-    ai_model:    str = None,
+    file:        UploadFile = File(..., description="Resume PDF file"),
+    ai_provider: str        = Form(None, description="BYOK provider name (openai | anthropic | google | groq | openrouter)"),
+    ai_api_key:  str        = Form(None, description="User's API key for the chosen provider"),
+    ai_model:    str        = Form(None, description="Optional model override"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -832,10 +832,30 @@ async def upload_resume(
         type("_Cfg", (), {"provider": ai_provider, "api_key": ai_api_key, "model": ai_model or None})()
     )
 
-    # Parse resume to YAML via AI
-    res2yaml = build_res2yaml_chain(upload_llm)
-    response = await res2yaml.ainvoke(input={"resume_content": resume_content})
-    resume_yaml = response.content
+    # Parse resume to YAML via AI — wrap so LLM errors surface as 4xx, not 500
+    try:
+        res2yaml = build_res2yaml_chain(upload_llm)
+        response = await res2yaml.ainvoke(input={"resume_content": resume_content})
+        resume_yaml = response.content
+    except HTTPException:
+        raise
+    except Exception as e:
+        err_str = str(e).lower()
+        if any(k in err_str for k in ("auth", "api key", "apikey", "401", "403", "invalid", "unauthorized", "incorrect")):
+            raise HTTPException(
+                status_code=401,
+                detail="AI provider rejected the API key. Please check your key in the AI Provider section and try again."
+            )
+        if any(k in err_str for k in ("quota", "rate", "429", "limit", "billing")):
+            raise HTTPException(
+                status_code=429,
+                detail="Your AI provider quota is exhausted or you've hit a rate limit. Please check your billing/quota and try again."
+            )
+        logger.error(f"LLM resume parse error for {current_user.id}: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to parse resume with AI provider. Please try again or switch providers. ({type(e).__name__})"
+        )
 
     # Strip markdown code fences if present
     if "```" in resume_yaml:
@@ -857,17 +877,23 @@ async def upload_resume(
                 f.write(resume_yaml)
 
     # Store resume directly on the user record (replaces any previous resume)
-    current_user.resume_yaml        = resume_yaml
-    current_user.resume_filename    = file.filename
-    current_user.resume_uploaded_at = datetime.utcnow()
-    db.commit()
-    db.refresh(current_user)
+    try:
+        current_user.resume_yaml        = resume_yaml
+        current_user.resume_filename    = file.filename
+        current_user.resume_uploaded_at = datetime.utcnow()
+        db.commit()
+        db.refresh(current_user)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"DB write error after resume parse for {current_user.id}: {e}")
+        raise HTTPException(status_code=500, detail="Resume was parsed but could not be saved. Please try again.")
 
     logger.info(f"[OK] Resume processed for {current_user.email}")
     return {
         "message":  "Resume uploaded and parsed successfully",
         "filename": file.filename,
     }
+
 
 
 @app.get('/my-resume')
@@ -1059,6 +1085,8 @@ async def optimize_resume_endpoint(
             optimized_yaml=optimized_yaml,
             keywords_added=keywords_added,
             improvements_made=improvements_made,
+            ai_provider=request.ai_config.provider if request.ai_config else None,
+            ai_model=request.ai_config.model       if request.ai_config else None,
         )
         db.add(record)
 
@@ -1086,6 +1114,8 @@ async def optimize_resume_endpoint(
             "keywords_added":             keywords_added,
             "critical_improvements_remaining": optimized_ats.critical_improvements,
             "optimized_resume_yaml":      optimized_yaml,
+            "ai_provider":                request.ai_config.provider if request.ai_config else None,
+            "ai_model":                   request.ai_config.model    if request.ai_config else None,
             "weekly_usage":               new_count,
             "weekly_limit":               weekly_limit,
             "resume_changes":             resume_changes,
@@ -1124,6 +1154,8 @@ async def get_my_optimizations(
             "match_level":          r.match_level,
             "keywords_added":       r.keywords_added,
             "improvements_made":    r.improvements_made,
+            "ai_provider":          r.ai_provider,
+            "ai_model":             r.ai_model,
             "created_at":           r.created_at.isoformat() if r.created_at else None,
         }
         for r in records

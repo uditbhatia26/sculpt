@@ -48,10 +48,13 @@ class OptimizedResume(Base):
     optimized_yaml      = Column(Text, nullable=False)
     keywords_added      = Column(JSONB, nullable=True)                          # List[str]
     improvements_made   = Column(JSONB, nullable=True)                          # List[str]
+    ai_provider         = Column(String, nullable=True)                         # BYOK: provider used (openai/anthropic/…)
+    ai_model            = Column(String, nullable=True)                         # BYOK: model used (gpt-4o-mini/…)
     created_at          = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationship
     user                = relationship("User", back_populates="optimized_resumes")
+
 
 
 class GenerationUsage(Base):
