@@ -1,45 +1,59 @@
+"""
+resume_functions.py
+===================
+High-level resume processing functions.
+
+All functions accept a `llm` parameter — a LangChain BaseChatModel built by
+`models.llm_factory.build_llm()` from the user's provider + API key.
+"""
+
 from models.chains import (
-    ats_chain, 
-    jd_parser_chain, 
-    enhanced_ats_chain, 
-    optimization_chain
+    build_jd_parser_chain,
+    build_enhanced_ats_chain,
+    build_optimization_chain,
+    build_ats_chain,
 )
 from schema.schema import parsedJobDescription
 
-async def ats(resume_content: str, job_description: parsedJobDescription):
-    """Based on the given job description score the given resume (OLD VERSION)"""
-    response = await ats_chain.ainvoke(
+
+async def ats(resume_content: str, job_description: parsedJobDescription, llm):
+    """(Legacy) Simple ATS score — kept for backward compatibility."""
+    chain = build_ats_chain(llm)
+    response = await chain.ainvoke(
         input={
-            'job_title': job_description.job_title,
-            'skills': job_description.skills,
-            'job_description': job_description.job_description,
-            'resume_yaml': resume_content
+            "job_title":       job_description.job_title,
+            "skills":          job_description.skills,
+            "job_description": job_description.job_description,
+            "resume_yaml":     resume_content,
         }
     )
     return response
 
-async def ats_detailed(resume_content: str, job_description: parsedJobDescription):
-    """Enhanced ATS calculation with detailed breakdown"""
-    response = await enhanced_ats_chain.ainvoke(
+
+async def ats_detailed(resume_content: str, job_description: parsedJobDescription, llm):
+    """Enhanced ATS calculation with detailed breakdown."""
+    chain = build_enhanced_ats_chain(llm)
+    response = await chain.ainvoke(
         input={
-            'job_title': job_description.job_title,
-            'skills': ', '.join(job_description.skills),
-            'job_description': job_description.job_description,
-            'resume_yaml': resume_content
+            "job_title":       job_description.job_title,
+            "skills":          ", ".join(job_description.skills),
+            "job_description": job_description.job_description,
+            "resume_yaml":     resume_content,
         }
     )
     return response
 
-async def parse_jd(job_description: str):
-    """Parse job description to extract key information"""
-    response = await jd_parser_chain.ainvoke(
-        input = {
-            'job_description': job_description
-        },
+
+async def parse_jd(job_description: str, llm):
+    """Parse job description to extract key information."""
+    chain = build_jd_parser_chain(llm)
+    response = await chain.ainvoke(
+        input={"job_description": job_description},
     )
     return response
 
-async def optimize_resume(resume_content: str, job_description, addons: str = ""):
+
+async def optimize_resume(resume_content: str, job_description, llm, addons: str = ""):
     """Optimize resume based on job description and optional addons.
 
     After LLM generation, a hard guardrail restores the education section
@@ -47,13 +61,14 @@ async def optimize_resume(resume_content: str, job_description, addons: str = ""
     """
     import yaml
 
-    response = await optimization_chain.ainvoke(
+    chain = build_optimization_chain(llm)
+    response = await chain.ainvoke(
         input={
-            'job_title': job_description.job_title,
-            'skills': ', '.join(job_description.skills),
-            'job_description': job_description.job_description,
-            'resume_yaml': resume_content,
-            'addons': addons if addons else "No additional information provided."
+            "job_title":       job_description.job_title,
+            "skills":          ", ".join(job_description.skills),
+            "job_description": job_description.job_description,
+            "resume_yaml":     resume_content,
+            "addons":          addons if addons else "No additional information provided.",
         }
     )
 
@@ -61,7 +76,11 @@ async def optimize_resume(resume_content: str, job_description, addons: str = ""
 
     # ---- Strip markdown fences ----
     if "```" in optimized_yaml:
-        optimized_yaml = optimized_yaml.split("```yaml")[-1] if "```yaml" in optimized_yaml else optimized_yaml.split("```")[-1]
+        optimized_yaml = (
+            optimized_yaml.split("```yaml")[-1]
+            if "```yaml" in optimized_yaml
+            else optimized_yaml.split("```")[-1]
+        )
         optimized_yaml = optimized_yaml.split("```")[0]
         optimized_yaml = optimized_yaml.strip()
 

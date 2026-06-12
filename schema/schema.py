@@ -3,6 +3,18 @@ from typing import Annotated, List, Optional
 from uuid import UUID
 
 
+# ==================== AI PROVIDER CONFIG (BYOK) ====================
+
+class AIProviderConfig(BaseModel):
+    """Bring-Your-Own-Key AI provider configuration.
+    Sent by the extension on every LLM-backed request.
+    The api_key is never stored in the database.
+    """
+    provider: Annotated[str,  Field(...,  description="Provider name: openai | anthropic | google | groq | openrouter")]
+    api_key:  Annotated[str,  Field(...,  description="The user's API key for this provider", min_length=8)]
+    model:    Annotated[Optional[str], Field(None, description="Model name override. Falls back to provider default if omitted.")]
+
+
 # ==================== AUTHENTICATION SCHEMAS ====================
 
 class UserSignup(BaseModel):
@@ -61,6 +73,7 @@ class parsedJobDescription(BaseModel):
 class CalculateATS(BaseModel):
     job_desc:     Annotated[str, Field(..., description="Job Description provided by the user", min_length=50, max_length=20_000)]
     jd_cache_id:  Optional[str] = Field(None, description="ID of a previously parsed and cached JD. If provided the LLM parse step is skipped.")
+    ai_config:    AIProviderConfig = Field(..., description="BYOK AI provider configuration")
 
 
 class ATS(BaseModel):
@@ -129,6 +142,16 @@ class OptimizeResumeRequest(BaseModel):
     job_desc:           Annotated[str, Field(..., description="Job Description provided by the user", min_length=50, max_length=20_000)]
     jd_cache_id:        Optional[str]   = Field(None,  description="ID of a previously parsed and cached JD. If provided, the LLM JD parse step is skipped.")
     original_ats_score: Optional[float] = Field(None,  description="ATS score already computed by /calculate-ats-detailed. If provided, the original ATS LLM call is skipped.", ge=0, le=100)
+    ai_config:          AIProviderConfig = Field(...,  description="BYOK AI provider configuration")
+
+
+# ==================== KEY VALIDATION SCHEMA ====================
+
+class ValidateKeyRequest(BaseModel):
+    """Used by POST /validate-key to test a user's API key."""
+    provider: Annotated[str, Field(..., description="Provider name")]
+    api_key:  Annotated[str, Field(..., description="The user's API key", min_length=8)]
+    model:    Annotated[Optional[str], Field(None, description="Optional model override")]
 
 
 class OptimizedResumeResponse(BaseModel):

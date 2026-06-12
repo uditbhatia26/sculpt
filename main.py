@@ -4,7 +4,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from schema.schema import (
     UserLogin, UserSignup, CalculateATS, AuthResponse,
-    DetailedATS, OptimizeResumeRequest, GeneratePDFRequest
+    DetailedATS, OptimizeResumeRequest, GeneratePDFRequest,
+    ValidateKeyRequest, AIProviderConfig
 )
 from dotenv import load_dotenv
 from config.database import get_db, test_connection
@@ -19,7 +20,8 @@ from config.pdf_generator import generate_pdf_from_yaml_string
 from config.email import send_verification_email
 from io import BytesIO
 from config.resume_functions import ats_detailed, optimize_resume, parse_jd
-from models.chains import llm, res2yaml_chain
+from models.chains import llm, build_res2yaml_chain
+from models.llm_factory import build_llm
 import yaml
 from datetime import datetime, timedelta, date
 import os
@@ -258,9 +260,19 @@ def jd_hash(raw_jd: str) -> str:
     return hashlib.sha256(raw_jd.strip().lower().encode("utf-8")).hexdigest()
 
 
-async def get_or_parse_jd(raw_jd: str, db: Session):
+async def get_or_parse_jd(raw_jd: str, db: Session, llm=None):
     """Return a cached parsedJobDescription for this JD, calling the LLM only on a cache miss.
-    
+
+    Parameters
+    ----------
+    raw_jd : str
+        The raw job description text.
+    db : Session
+        SQLAlchemy DB session.
+    llm : BaseChatModel | None
+        Per-request LangChain LLM built from user's BYOK config.
+        Required on cache misses. If None and a cache miss occurs, raises 400.
+
     Returns:
         tuple[parsedJobDescription, str]: (parsed_jd object, cache_id string)
     """
@@ -279,8 +291,13 @@ async def get_or_parse_jd(raw_jd: str, db: Session):
         return parsed, str(cached.id)
 
     # --- Cache miss — call LLM ---
+    if llm is None:
+        raise HTTPException(
+            status_code=400,
+            detail="AI provider config is required for first-time job description parsing."
+        )
     logger.info(f"[CACHE MISS] Parsing JD via LLM for hash {digest[:12]}...")
-    parsed = await parse_jd(job_description=raw_jd)
+    parsed = await parse_jd(job_description=raw_jd, llm=llm)
 
     record = ParsedJDCache(
         id=uuid.uuid4(),
@@ -362,7 +379,23 @@ def health():
     return {"status": "OK", "model_loaded": llm is not None}
 
 
+
 # ==================== JD PARSING ENDPOINT ====================
+
+
+def _build_llm_from_config(ai_config):
+    """Helper: build per-request LLM from an AIProviderConfig, catching auth errors."""
+    try:
+        return build_llm(
+            provider=ai_config.provider,
+            api_key=ai_config.api_key,
+            model=ai_config.model,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to initialise AI provider: {e}")
+
 
 @app.post('/parse-jd')
 async def parse_job_description(
@@ -371,11 +404,13 @@ async def parse_job_description(
     db: Session = Depends(get_db)
 ):
     """Parse and cache a job description. Returns a jd_cache_id the client should
-    pass to /calculate-ats-detailed and /optimize-resume to skip repeated LLM parsing."""
+    pass to /calculate-ats-detailed and /optimize-resume to skip repeated LLM parsing.
+    Requires ai_config (provider + api_key) in the request body."""
     if not request.job_desc.strip():
         raise HTTPException(status_code=400, detail="Job description cannot be empty.")
 
-    parsed, cache_id = await get_or_parse_jd(request.job_desc, db)
+    request_llm = _build_llm_from_config(request.ai_config)
+    parsed, cache_id = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
     logger.info(f"JD parsed/cached for {current_user.email}: cache_id={cache_id}")
     return {
         "jd_cache_id": cache_id,
@@ -383,6 +418,40 @@ async def parse_job_description(
         "skills":      parsed.skills,
     }
 
+
+# ==================== KEY VALIDATION ENDPOINT ====================
+
+@app.post('/validate-key')
+async def validate_api_key(
+    request: ValidateKeyRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Test whether a user-supplied API key is valid by making a minimal single-token
+    completion call to the chosen provider. Returns 200 on success."""
+    try:
+        test_llm = build_llm(
+            provider=request.provider,
+            api_key=request.api_key,
+            model=request.model,
+        )
+        # Minimal test call — ask for a single word so token usage is near-zero
+        await test_llm.ainvoke("Reply with the single word OK")
+        from models.llm_factory import PROVIDER_LABELS, PROVIDER_DEFAULTS
+        resolved_model = request.model or PROVIDER_DEFAULTS.get(request.provider.lower(), "")
+        return {
+            "valid":    True,
+            "provider": PROVIDER_LABELS.get(request.provider.lower(), request.provider),
+            "model":    resolved_model,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        err_str = str(e).lower()
+        if any(k in err_str for k in ("auth", "api key", "apikey", "401", "403", "invalid", "unauthorized")):
+            raise HTTPException(status_code=401, detail="Invalid API key. Please check your key and try again.")
+        if any(k in err_str for k in ("quota", "rate", "429", "limit")):
+            raise HTTPException(status_code=429, detail="API key is valid but your quota is exhausted.")
+        raise HTTPException(status_code=502, detail=f"Provider error: {e}")
 
 # ==================== AUTHENTICATION ENDPOINTS ====================
 
@@ -688,10 +757,17 @@ def resend_verification(
 @app.post('/upload-resume')
 async def upload_resume(
     file: UploadFile = File(..., description="Resume PDF file"),
+    ai_provider: str = None,
+    ai_api_key:  str = None,
+    ai_model:    str = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Upload and parse user's resume. Replaces any previously uploaded resume."""
+    """Upload and parse user's resume.
+
+    Multipart form: file (PDF) + ai_provider, ai_api_key, ai_model (text fields).
+    Replaces any previously uploaded resume.
+    """
     logger.info(f"Resume upload for user: {current_user.email}")
 
     # Block unverified users from using LLM-backed features
@@ -744,8 +820,21 @@ async def upload_resume(
     if not resume_content.strip():
         raise HTTPException(status_code=400, detail="No text found in PDF. Please ensure the resume is not a scanned image.")
 
+    # Validate BYOK config fields (required for the res2yaml LLM call)
+    if not ai_provider or not ai_api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="ai_provider and ai_api_key are required form fields for resume parsing."
+        )
+
+    # Build per-request LLM from user-supplied key
+    upload_llm = _build_llm_from_config(
+        type("_Cfg", (), {"provider": ai_provider, "api_key": ai_api_key, "model": ai_model or None})()
+    )
+
     # Parse resume to YAML via AI
-    response = await res2yaml_chain.ainvoke(input={"resume_content": resume_content})
+    res2yaml = build_res2yaml_chain(upload_llm)
+    response = await res2yaml.ainvoke(input={"resume_content": resume_content})
     resume_yaml = response.content
 
     # Strip markdown code fences if present
@@ -824,6 +913,9 @@ async def calculate_ats_detailed(
     if not current_user.resume_yaml:
         raise HTTPException(status_code=404, detail="No resume found. Please upload a resume first.")
 
+    # Build per-request LLM from BYOK config
+    request_llm = _build_llm_from_config(request.ai_config)
+
     # Use cached parse if the client provided a jd_cache_id
     if request.jd_cache_id:
         cached = db.query(ParsedJDCache).filter(
@@ -839,12 +931,12 @@ async def calculate_ats_detailed(
             logger.info(f"[CACHE HIT] Reused parsed JD for ATS (cache_id={request.jd_cache_id})")
         else:
             logger.warning(f"jd_cache_id {request.jd_cache_id} not found — falling back to live parse")
-            parsed_jd, _ = await get_or_parse_jd(request.job_desc, db)
+            parsed_jd, _ = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
     else:
-        parsed_jd, _ = await get_or_parse_jd(request.job_desc, db)
+        parsed_jd, _ = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
 
     try:
-        result = await ats_detailed(current_user.resume_yaml, parsed_jd)
+        result = await ats_detailed(current_user.resume_yaml, parsed_jd, request_llm)
         logger.info(f"ATS score for {current_user.email}: {result.overall_score}")
         return result
     except Exception as e:
@@ -860,15 +952,12 @@ async def optimize_resume_endpoint(
 ):
     """
     Optimize resume for a job description.
-    
+
     Accepts optional `jd_cache_id` (skip LLM JD parse) and `original_ats_score`
     (skip re-running the original ATS calculation — already done by /calculate-ats-detailed).
-    
-    Enforces weekly generation limits based on the user's plan:
-      - free: 5 generations / week
-      - pro:  30 generations / week
+    Requires ai_config (provider + api_key) in the request body.
     """
-    logger.info(f"Resume optimization for user: {current_user.email} (plan: {current_user.plan})")
+    logger.info(f"Resume optimization for user: {current_user.email}")
 
     # Block unverified users
     if not current_user.email_verified:
@@ -883,8 +972,8 @@ async def optimize_resume_endpoint(
     if not current_user.resume_yaml:
         raise HTTPException(status_code=404, detail="No resume found. Please upload a resume first.")
 
-    # ---- Paywall check ----
-    check_generation_limit(current_user, db)
+    # Build per-request LLM from BYOK config
+    request_llm = _build_llm_from_config(request.ai_config)
 
     # ---- Resolve parsed JD (cache-first) ----
     if request.jd_cache_id:
@@ -901,19 +990,18 @@ async def optimize_resume_endpoint(
             logger.info(f"[CACHE HIT] Reused parsed JD for optimize (cache_id={request.jd_cache_id})")
         else:
             logger.warning(f"jd_cache_id {request.jd_cache_id} not found — falling back to live parse")
-            parsed_jd, _ = await get_or_parse_jd(request.job_desc, db)
+            parsed_jd, _ = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
     else:
-        parsed_jd, _ = await get_or_parse_jd(request.job_desc, db)
+        parsed_jd, _ = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
 
     try:
         # ---- Original ATS score (skip if already computed by the Analyze step) ----
         if request.original_ats_score is not None:
             logger.info(f"Using pre-computed original ATS score: {request.original_ats_score} for {current_user.email}")
-            # Build a minimal object so we can still compute keywords_added diff
             original_ats = None
             original_score_value = request.original_ats_score
         else:
-            original_ats = await ats_detailed(current_user.resume_yaml, parsed_jd)
+            original_ats = await ats_detailed(current_user.resume_yaml, parsed_jd, request_llm)
             original_score_value = original_ats.overall_score
             logger.info(f"Original ATS for {current_user.email}: {original_score_value}")
 
@@ -921,6 +1009,7 @@ async def optimize_resume_endpoint(
         optimized_yaml = await optimize_resume(
             resume_content=current_user.resume_yaml,
             job_description=parsed_jd,
+            llm=request_llm,
             addons=""
         )
 
@@ -930,7 +1019,7 @@ async def optimize_resume_endpoint(
             optimized_yaml = optimized_yaml.split("```")[0].strip()
 
         # ---- Score the optimized resume ----
-        optimized_ats = await ats_detailed(optimized_yaml, parsed_jd)
+        optimized_ats = await ats_detailed(optimized_yaml, parsed_jd, request_llm)
         logger.info(f"Optimized ATS for {current_user.email}: {optimized_ats.overall_score}")
 
         # ---- Build improvement metadata ----
