@@ -1040,6 +1040,44 @@ async def get_my_optimizations(
         for r in records
     ]
 
+@app.get('/my-optimizations/{record_id}/pdf')
+async def download_optimization_pdf(
+    record_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Re-download a past optimized resume as a PDF by its record ID."""
+    try:
+        rid = uuid.UUID(record_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid optimization ID.")
+
+    record = (
+        db.query(OptimizedResume)
+        .filter(OptimizedResume.id == rid, OptimizedResume.user_id == current_user.id)
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="Optimization not found.")
+
+    try:
+        pdf_bytes = generate_pdf_from_yaml_string(record.optimized_yaml)
+    except Exception as e:
+        logger.error(f"PDF re-download error for record {record_id}: {e}")
+        raise HTTPException(status_code=500, detail="PDF generation failed.")
+
+    safe_title = (record.job_title or "optimized_resume").replace(" ", "_")[:40]
+    filename = f"resume_{safe_title}.pdf"
+
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(pdf_bytes)),
+        },
+    )
+
 
 # ==================== PDF GENERATION ENDPOINT ====================
 
