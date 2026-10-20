@@ -12,8 +12,10 @@ from models.chains import (
     build_enhanced_ats_chain,
     build_optimization_chain,
     build_ats_chain,
+    build_explain_changes_chain,
 )
 from schema.schema import parsedJobDescription
+from config.prompts import TEMPLATE_GUIDANCE
 
 
 async def ats(resume_content: str, job_description: parsedJobDescription, llm):
@@ -53,22 +55,30 @@ async def parse_jd(job_description: str, llm):
     return response
 
 
-async def optimize_resume(resume_content: str, job_description, llm, addons: str = ""):
-    """Optimize resume based on job description and optional addons.
+async def optimize_resume(
+    resume_content: str,
+    job_description,
+    llm,
+    addons: str = "",
+    template: str = "jakes_resume",
+):
+    """Optimize resume based on job description, optional addons, and template layout guidance.
 
     After LLM generation, a hard guardrail restores the education section
     verbatim from the original resume so it can never be altered by the model.
     """
     import yaml
 
+    guidance = TEMPLATE_GUIDANCE.get(template, TEMPLATE_GUIDANCE["jakes_resume"])
     chain = build_optimization_chain(llm)
     response = await chain.ainvoke(
         input={
-            "job_title":       job_description.job_title,
-            "skills":          ", ".join(job_description.skills),
-            "job_description": job_description.job_description,
-            "resume_yaml":     resume_content,
-            "addons":          addons if addons else "No additional information provided.",
+            "job_title":          job_description.job_title,
+            "skills":             ", ".join(job_description.skills),
+            "job_description":    job_description.job_description,
+            "resume_yaml":        resume_content,
+            "addons":             addons if addons else "No additional information provided.",
+            "template_guidance":  guidance,
         }
     )
 
@@ -107,3 +117,48 @@ async def optimize_resume(resume_content: str, job_description, llm, addons: str
         pass
 
     return optimized_yaml
+
+
+async def explain_resume_changes(
+    original_yaml: str,
+    optimized_yaml: str,
+    job_description: str,
+    llm,
+):
+    """Generate structured explanations of resume changes and strategic rationale."""
+    chain = build_explain_changes_chain(llm)
+    response = await chain.ainvoke(
+        input={
+            "job_description": job_description if job_description else "Target software engineering role",
+            "original_resume": original_yaml,
+            "optimized_resume": optimized_yaml,
+        }
+    )
+    return response
+
+
+async def optimize_resume_agentic(
+    resume_content: str,
+    job_description,
+    llm,
+    original_ats_score: float = None,
+    template: str = "jakes_resume",
+    target_page_count: int = None,
+    addons: str = "",
+):
+    """Runs the LangGraph multi-node optimization and validation workflow."""
+    from models.workflow import run_resume_optimization_workflow
+
+    inputs = {
+        "user_id": "",
+        "original_resume_yaml": resume_content,
+        "target_job_description": getattr(job_description, "job_description", str(job_description)),
+        "parsed_jd": job_description,
+        "selected_template": template,
+        "target_page_count": target_page_count or (1 if template == "compact_onepage" else 2),
+        "llm": llm,
+        "addons": addons,
+        "original_ats_score": original_ats_score or 0.0,
+    }
+
+    return await run_resume_optimization_workflow(inputs)

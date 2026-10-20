@@ -8,7 +8,10 @@ Your task is to extract ALL information from the provided resume and organize it
 1. **Completeness**: Extract ALL information present in the resume - don't omit any details
 2. **Flexibility**: Adapt the YAML structure based on what's present in the resume
 3. **Consistency**: Use consistent field naming (snake_case for keys)
-4. **Accuracy**: Preserve exact data (dates, numbers, names) as they appear
+4. **Accuracy & Verbatim Degree Extraction**:
+   - Preserve exact data (dates, numbers, names, degrees) as they appear in the source text.
+   - **NEVER INFER OR UPGRADE DEGREES**: If the resume says "B.Tech", "Bachelor of Technology", "B.E.", or "B.S.", NEVER output "M.S." or "Master". Extract the EXACT degree stated in the document.
+   - Separate the qualification name (e.g. "B.Tech") into `degree`, and the specialization (e.g. "Information Technology") into `major`.
 5. **Structure**: Use appropriate nesting for related information
 
 ## Standard YAML Structure:
@@ -40,8 +43,8 @@ experience:
 
 education:
   - institution: "University/College Name"
-    degree: "Degree Name (B.S., M.S., Ph.D., etc.)"
-    major: "Major/Specialization" # if mentioned
+    degree: "Exact Degree as written (e.g. B.Tech, B.E., B.S., M.S., Ph.D. - NEVER alter B.Tech to M.S.)"
+    major: "Major/Specialization (e.g. Information Technology)" # if mentioned
     minor: "Minor" # if mentioned
     cgpa: 8.5 # or gpa: 3.8, or percentage: 85%
     period: "Start Year - End Year"
@@ -422,6 +425,28 @@ OUTPUT REQUIREMENTS:
 - Clean, professional content
 """
 
+TEMPLATE_GUIDANCE = {
+    "compact_onepage": (
+        "LAYOUT & LENGTH CONSTRAINT (Compact 1-Page Layout):\n"
+        "- Target: Strictly guarantee a crisp 1-page fit.\n"
+        "- Bullet Phrasing: Enforce strict character brevity. Write punchy, high-signal 1-line statements (maximum 2 lines only if exceptional metrics).\n"
+        "- Experience: Limit to top 3-4 high-impact bullets per role. Trim secondary responsibilities and prioritize quantifiable results.\n"
+        "- Projects: Limit highlights to 2-3 concise bullets focusing on core architecture and outcomes."
+    ),
+    "classic_ivy": (
+        "LAYOUT & TONE CONSTRAINT (Classic Ivy Corporate Layout):\n"
+        "- Tone: Use formal executive / corporate diction suitable for elite corporate, finance, and management consulting roles.\n"
+        "- Focus: Highlight leadership, cross-functional collaboration, stakeholder management, and business revenue / operational ROI.\n"
+        "- Bullets: Balanced narrative structure with deep context, actions, and strategic outcomes."
+    ),
+    "jakes_resume": (
+        "LAYOUT & TONE CONSTRAINT (Standard Tech / Jake's Resume):\n"
+        "- Focus: Maximum technical ATS impact using the Google XYZ / STAR format (Accomplished [X] as measured by [Y], by doing [Z]).\n"
+        "- Technologies: Prominently feature tech stack in project headings and naturally weave core technical keywords into experience bullets.\n"
+        "- Skills: High density, logical categorization of programming languages, frameworks, cloud, and tools."
+    ),
+}
+
 OPTIMIZATION_HUMAN_TEMPLATE = """
 Optimize this resume for maximum ATS performance and job alignment.
 
@@ -438,15 +463,47 @@ ORIGINAL RESUME (YAML):
 ADDONS (Additional Skills/Projects/Certs to Consider):
 {addons}
 
+TARGET TEMPLATE & LAYOUT GUIDANCE:
+{template_guidance}
+
 Generate an optimized resume that:
 1. Maximizes ATS score (target: 85+)
 2. Naturally integrates relevant keywords
 3. Enhances bullets with metrics and impact
-4. Smartly incorporates relevant addons
-5. Maintains 100% truthfulness
-6. Copies the education section VERBATIM from the original resume — zero changes allowed
+4. Follows the target template layout and length guidance above
+5. Smartly incorporates relevant addons
+6. Maintains 100% truthfulness
+7. Copies the education section VERBATIM from the original resume — zero changes allowed
 
 IMPORTANT REMINDER: The education section must be reproduced character-for-character from the original resume. Any deviation is a critical error.
 
 Output ONLY the optimized resume in clean YAML format. No markdown, no explanations.
+"""
+
+EXPLAIN_CHANGES_SYSTEM_PROMPT = """
+You are an expert Executive Career Coach and ATS Specialist.
+Your task is to analyze the exact differences between a candidate's ORIGINAL resume and their OPTIMIZED resume tailored for a specific job description.
+
+Explain clearly, concisely, and insightfully WHAT changes were made and WHY each change improves ATS pass rates, recruiter engagement, and alignment with the target role.
+
+Highlight:
+1. Summary Rationale: How the professional summary / title was repositioned to immediately hook the hiring manager.
+2. Key Bullet Enhancements: Select 3 to 6 of the most impactful bullet transformations across experience and projects. For each, show what was enhanced (quantified impact, active verbs, STAR format, key tech stack).
+3. Skills Strategy: What keywords or technical domains were added or reprioritized to match the job requirements.
+4. Factual Integrity: Emphasize that education, job titles, companies, and actual history remained truthful and untampered.
+"""
+
+EXPLAIN_CHANGES_HUMAN_TEMPLATE = """
+Compare the candidate's original resume with the optimized version tailored for the following job description:
+
+JOB DESCRIPTION:
+{job_description}
+
+ORIGINAL RESUME (YAML):
+{original_resume}
+
+OPTIMIZED RESUME (YAML):
+{optimized_resume}
+
+Provide a structured, insightful explanation detailing the strategy and specific changes made to optimize this resume.
 """
