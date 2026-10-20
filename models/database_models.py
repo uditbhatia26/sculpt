@@ -22,6 +22,8 @@ class User(Base):
 
     # Resume stored directly on the user (one active resume at a time)
     resume_yaml         = Column(Text, nullable=True)
+    resume_latex        = Column(Text, nullable=True)
+    selected_template   = Column(String, default="jakes_resume")
     resume_filename     = Column(String, nullable=True)
     resume_uploaded_at  = Column(DateTime(timezone=True), nullable=True)
 
@@ -46,6 +48,8 @@ class OptimizedResume(Base):
     score_improvement   = Column(Float, nullable=False)
     match_level         = Column(String, nullable=True)                         # Excellent/Good/Fair/Poor
     optimized_yaml      = Column(Text, nullable=False)
+    resume_latex        = Column(Text, nullable=True)
+    selected_template   = Column(String, default="jakes_resume")
     keywords_added      = Column(JSONB, nullable=True)                          # List[str]
     improvements_made   = Column(JSONB, nullable=True)                          # List[str]
     ai_provider         = Column(String, nullable=True)                         # BYOK: provider used (openai/anthropic/…)

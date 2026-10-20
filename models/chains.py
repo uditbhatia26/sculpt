@@ -21,8 +21,10 @@ from config.prompts import (
     ENHANCED_ATS_HUMAN_TEMPLATE,
     OPTIMIZATION_SYSTEM_PROMPT,
     OPTIMIZATION_HUMAN_TEMPLATE,
+    EXPLAIN_CHANGES_SYSTEM_PROMPT,
+    EXPLAIN_CHANGES_HUMAN_TEMPLATE,
 )
-from schema.schema import parsedJobDescription, ATS, DetailedATS
+from schema.schema import parsedJobDescription, ATS, DetailedATS, ChangeExplanationResponse
 from dotenv import load_dotenv
 import os
 import logging
@@ -104,3 +106,15 @@ def build_optimization_chain(llm):
         ]
     )
     return optimization_prompt | llm
+
+
+def build_explain_changes_chain(llm):
+    """Structured chain explaining resume changes and strategy."""
+    explainer_llm = llm.with_structured_output(ChangeExplanationResponse)
+    prompt = ChatPromptTemplate(
+        [
+            ("system", EXPLAIN_CHANGES_SYSTEM_PROMPT),
+            ("human", EXPLAIN_CHANGES_HUMAN_TEMPLATE),
+        ]
+    )
+    return prompt | explainer_llm
