@@ -5,7 +5,8 @@ from sqlalchemy.exc import IntegrityError
 from schema.schema import (
     UserLogin, UserSignup, CalculateATS, AuthResponse,
     DetailedATS, OptimizeResumeRequest, GeneratePDFRequest,
-    ValidateKeyRequest, AIProviderConfig
+    ValidateKeyRequest, AIProviderConfig,
+    ExplainChangesRequest, ChangeExplanationResponse
 )
 from dotenv import load_dotenv
 from config.database import get_db, test_connection
@@ -17,9 +18,14 @@ from config.auth import (
 )
 from models.database_models import User, OptimizedResume, GenerationUsage, ParsedJDCache
 from config.pdf_generator import generate_pdf_from_yaml_string
+from config.latex_generator import (
+    render_latex_template,
+    compile_latex_to_pdf,
+    generate_pdf_from_resume,
+)
 from config.email import send_verification_email
 from io import BytesIO
-from config.resume_functions import ats_detailed, optimize_resume, parse_jd
+from config.resume_functions import ats_detailed, optimize_resume, optimize_resume_agentic, parse_jd, explain_resume_changes
 from models.chains import llm, build_res2yaml_chain
 from models.llm_factory import build_llm
 import yaml
@@ -1031,37 +1037,39 @@ async def optimize_resume_endpoint(
             original_score_value = original_ats.overall_score
             logger.info(f"Original ATS for {current_user.email}: {original_score_value}")
 
-        # ---- Generate the optimized resume ----
-        optimized_yaml = await optimize_resume(
+        target_template = getattr(request, "template", None) or getattr(current_user, "selected_template", None) or "jakes_resume"
+
+        # ---- Run Agentic Optimization & Validation Workflow ----
+        workflow_result = await optimize_resume_agentic(
             resume_content=current_user.resume_yaml,
             job_description=parsed_jd,
             llm=request_llm,
-            addons=""
+            original_ats_score=original_score_value,
+            template=target_template,
+            addons="",
         )
 
-        # Strip markdown fences
-        if "```" in optimized_yaml:
-            optimized_yaml = optimized_yaml.split("```yaml")[-1] if "```yaml" in optimized_yaml else optimized_yaml.split("```")[-1]
-            optimized_yaml = optimized_yaml.split("```")[0].strip()
+        optimized_yaml = workflow_result.get("final_yaml", "")
+        rendered_latex = workflow_result.get("final_latex")
+        optimized_score = workflow_result.get("current_ats_score", original_score_value)
+        keywords_added = workflow_result.get("keywords_added", [])
+        improvements_made = workflow_result.get("improvements_made", [])
+        actual_page_count = workflow_result.get("actual_page_count", 1)
+        iterations_used = len(workflow_result.get("score_history", [])) or (workflow_result.get("iteration_count", 0) + 1)
 
-        # ---- Score the optimized resume ----
-        optimized_ats = await ats_detailed(optimized_yaml, parsed_jd, request_llm)
-        logger.info(f"Optimized ATS for {current_user.email}: {optimized_ats.overall_score}")
+        current_ats_details = workflow_result.get("current_ats_details") or {}
+        match_level = current_ats_details.get("match_level")
+        if not match_level:
+            if optimized_score >= 85:
+                match_level = "Excellent"
+            elif optimized_score >= 70:
+                match_level = "Good"
+            elif optimized_score >= 55:
+                match_level = "Fair"
+            else:
+                match_level = "Poor"
 
-        # ---- Build improvement metadata ----
-        if original_ats is not None:
-            keywords_added = list(
-                set(optimized_ats.keyword_analysis.matched_keywords) -
-                set(original_ats.keyword_analysis.matched_keywords)
-            )
-        else:
-            # We didn't re-run the original ATS — diff is unavailable, return empty list
-            keywords_added = []
-
-        improvements_made = [
-            f"Score improved from {original_score_value:.1f} to {optimized_ats.overall_score:.1f}",
-            f"Added {len(keywords_added)} new matching keywords",
-        ]
+        critical_improvements_remaining = current_ats_details.get("critical_improvements", [])
 
         # Save debug copy (only when DEBUG_DUMP=true in .env)
         if os.getenv("DEBUG_DUMP", "false").lower() == "true":
@@ -1079,10 +1087,12 @@ async def optimize_resume_endpoint(
             job_description=request.job_desc,
             job_title=parsed_jd.job_title,
             original_ats_score=original_score_value,
-            optimized_ats_score=optimized_ats.overall_score,
-            score_improvement=optimized_ats.overall_score - original_score_value,
-            match_level=optimized_ats.match_level,
+            optimized_ats_score=optimized_score,
+            score_improvement=optimized_score - original_score_value,
+            match_level=match_level,
             optimized_yaml=optimized_yaml,
+            resume_latex=rendered_latex,
+            selected_template=target_template,
             keywords_added=keywords_added,
             improvements_made=improvements_made,
             ai_provider=request.ai_config.provider if request.ai_config else None,
@@ -1095,7 +1105,7 @@ async def optimize_resume_endpoint(
         db.commit()
 
         weekly_limit = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
-        logger.info(f"[OK] Optimization complete for {current_user.email}. Weekly usage: {new_count}/{weekly_limit}")
+        logger.info(f"[OK] Optimization complete for {current_user.email}. Iterations: {iterations_used}, Page count: {actual_page_count}, Weekly usage: {new_count}/{weekly_limit}")
 
         # ---- Compute changelog diff ----
         resume_changes = compute_resume_diff(current_user.resume_yaml, optimized_yaml)
@@ -1107,13 +1117,16 @@ async def optimize_resume_endpoint(
         return {
             "message":                    "Resume optimized successfully",
             "original_score":             round(original_score_value, 2),
-            "optimized_score":            round(optimized_ats.overall_score, 2),
-            "score_improvement":          round(optimized_ats.overall_score - original_score_value, 2),
-            "match_level":                optimized_ats.match_level,
+            "optimized_score":            round(optimized_score, 2),
+            "score_improvement":          round(optimized_score - original_score_value, 2),
+            "match_level":                match_level,
             "improvements_made":          improvements_made,
             "keywords_added":             keywords_added,
-            "critical_improvements_remaining": optimized_ats.critical_improvements,
+            "critical_improvements_remaining": critical_improvements_remaining,
             "optimized_resume_yaml":      optimized_yaml,
+            "selected_template":          target_template,
+            "actual_page_count":          actual_page_count,
+            "iterations_used":            iterations_used,
             "ai_provider":                request.ai_config.provider if request.ai_config else None,
             "ai_model":                   request.ai_config.model    if request.ai_config else None,
             "weekly_usage":               new_count,
@@ -1128,6 +1141,71 @@ async def optimize_resume_endpoint(
     except Exception as e:
         logger.error(f"Optimization error for {current_user.id}: {e}")
         raise HTTPException(status_code=500, detail="Unable to optimize resume. Please try again.")
+
+
+# ==================== EXPLAIN CHANGES ENDPOINT ====================
+
+@app.post("/explain-changes", response_model=ChangeExplanationResponse)
+async def explain_changes_endpoint(
+    request: ExplainChangesRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Explain the strategic changes between the original resume and the optimized version.
+    Called on-demand only when the user clicks 'Why were these changes made?' in the UI.
+    """
+    original_yaml = request.original_yaml or current_user.resume_yaml
+    if not original_yaml:
+        raise HTTPException(
+            status_code=400,
+            detail="Original resume is required. Please upload a resume first."
+        )
+
+    if not request.optimized_yaml:
+        raise HTTPException(
+            status_code=400,
+            detail="Optimized resume YAML is required to explain changes."
+        )
+
+    # Resolve LLM: client BYOK first, then server fallback
+    request_llm = None
+    if request.ai_config:
+        try:
+            request_llm = _build_llm_from_config(request.ai_config)
+        except Exception as e:
+            logger.warning(f"Could not build client LLM for {current_user.email}: {e}")
+
+    if request_llm is None:
+        openai_key = os.getenv("OPENAI_API_KEY")
+        groq_key = os.getenv("GROQ_API_KEY")
+        if openai_key:
+            from langchain_openai import ChatOpenAI
+            request_llm = ChatOpenAI(api_key=openai_key, model="gpt-4o-mini")
+        elif groq_key:
+            from langchain_groq import ChatGroq
+            request_llm = ChatGroq(api_key=groq_key, model="llama-3.3-70b-versatile")
+
+    if request_llm is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No AI provider configured. Please provide an API key in your Account settings."
+        )
+
+    try:
+        explanation = await explain_resume_changes(
+            original_yaml=original_yaml,
+            optimized_yaml=request.optimized_yaml,
+            job_description=request.job_description or "",
+            llm=request_llm,
+        )
+        return explanation
+    except Exception as e:
+        logger.error(f"Error explaining changes for {current_user.id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to generate change explanation: {str(e)}"
+        )
 
 
 # ==================== HISTORY ENDPOINT ====================
@@ -1157,6 +1235,8 @@ async def get_my_optimizations(
             "ai_provider":          r.ai_provider,
             "ai_model":             r.ai_model,
             "created_at":           r.created_at.isoformat() if r.created_at else None,
+            "selected_template":    getattr(r, "selected_template", None) or "jakes_resume",
+            "optimized_yaml":       r.optimized_yaml,
         }
         for r in records
     ]
@@ -1182,7 +1262,8 @@ async def download_optimization_pdf(
         raise HTTPException(status_code=404, detail="Optimization not found.")
 
     try:
-        pdf_bytes = generate_pdf_from_yaml_string(record.optimized_yaml)
+        template = getattr(record, "selected_template", None) or "jakes_resume"
+        pdf_bytes = generate_pdf_from_resume(record.optimized_yaml, template=template)
     except Exception as e:
         logger.error(f"PDF re-download error for record {record_id}: {e}")
         raise HTTPException(status_code=500, detail="PDF generation failed.")
@@ -1209,12 +1290,17 @@ async def generate_pdf_endpoint(
     body: GeneratePDFRequest = None,
 ):
     """
-    Generate a PDF from a resume YAML string and stream it back.
+    Generate a PDF or raw .tex from a resume YAML string and stream it back.
 
     Body (optional JSON):
-        { "resume_yaml": "<yaml string>" }
+        {
+            "resume_yaml": "<yaml string>",
+            "template": "jakes_resume" | "classic_ivy" | "compact_onepage",
+            "return_tex": false
+        }
 
     If resume_yaml is omitted, the user's stored base resume is used.
+    If return_tex is true, returns the raw LaTeX source code.
     """
     # Resolve which YAML to render
     resume_yaml = None
@@ -1224,20 +1310,39 @@ async def generate_pdf_endpoint(
     if not resume_yaml:
         resume_yaml = current_user.resume_yaml
 
-
     if not resume_yaml:
         raise HTTPException(
             status_code=404,
             detail="No resume found. Please upload a resume first."
         )
 
+    user_template = getattr(current_user, "selected_template", None) or "jakes_resume"
+    template_name = (body.template if body and body.template else None) or user_template
+
+    # Raw LaTeX source code requested (e.g. for Overleaf export)
+    if body and body.return_tex:
+        try:
+            tex_source = render_latex_template(resume_yaml, template_name=template_name)
+        except Exception as e:
+            logger.error(f"LaTeX rendering error for {current_user.id}: {e}")
+            raise HTTPException(status_code=500, detail=f"LaTeX generation failed: {e}")
+
+        return Response(
+            content=tex_source,
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="resume.tex"',
+            },
+        )
+
+    # PDF compilation via Tectonic (with fallback to ReportLab)
     try:
-        pdf_bytes = generate_pdf_from_yaml_string(resume_yaml)
+        pdf_bytes = generate_pdf_from_resume(resume_yaml, template=template_name)
     except Exception as e:
         logger.error(f"PDF generation error for {current_user.id}: {e}")
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
 
-    logger.info(f"[OK] PDF generated for {current_user.email} ({len(pdf_bytes):,} bytes)")
+    logger.info(f"[OK] PDF generated for {current_user.email} using template '{template_name}' ({len(pdf_bytes):,} bytes)")
 
     return StreamingResponse(
         iter([pdf_bytes]),

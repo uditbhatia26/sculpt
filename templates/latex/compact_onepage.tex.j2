@@ -1,0 +1,204 @@
+\documentclass[letterpaper,10pt]{article}
+
+\usepackage{latexsym}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{verbatim}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+\usepackage{hyphenat}
+\usepackage{iftex}
+
+\ifPDFTeX
+  \input{glyphtounicode}
+  \pdfgentounicode=1
+\fi
+
+\pagestyle{fancy}
+\fancyhf{} % clear all header and footer fields
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% Margins optimized for strict 1-page fit with Jake's Resume proportions
+\addtolength{\oddsidemargin}{-0.6in}
+\addtolength{\evensidemargin}{-0.6in}
+\addtolength{\textwidth}{1.2in}
+\addtolength{\topmargin}{-0.65in}
+\addtolength{\textheight}{1.35in}
+
+\urlstyle{same}
+
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+
+% Section formatting identical to Jake's Resume
+\titleformat{\section}{
+  \vspace{-4pt}\scshape\raggedright\large
+}{}{0em}{}[\color{black}\titlerule \vspace{-4pt}]
+
+%-------------------------
+% Custom commands matching Jake's Resume styling with clean 1-page spacing
+\newcommand{\resumeItem}[1]{
+  \item\small{#1}
+}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-2pt}\item
+    \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{#1} & #2 \\
+      \textit{\small#3} & \textit{\small #4} \\
+    \end{tabular*}\vspace{-3pt}
+}
+
+\newcommand{\resumeSubSubheading}[2]{
+    \item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \textit{\small#1} & \textit{\small #2} \\
+    \end{tabular*}\vspace{-3pt}
+}
+
+\newcommand{\resumeProjectHeading}[2]{
+    \vspace{-2pt}\item
+    \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \small#1 & #2 \\
+    \end{tabular*}\vspace{-3pt}
+}
+
+\newcommand{\resumeSubItem}[1]{\resumeItem{#1}\vspace{-3pt}}
+
+\renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}, topsep=1pt, partopsep=0pt]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}\vspace{-2pt}}
+\newcommand{\resumeItemListStart}{\begin{itemize}[leftmargin=0.15in, itemsep=0.5pt, topsep=1.0pt, parsep=0pt, partopsep=0pt]}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-3pt}}
+
+%-------------------------------------------
+%%%%%%  RESUME STARTS HERE  %%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{document}
+
+%----------HEADING----------
+\begin{center}
+    \textbf{\Huge \scshape {{ resume.name | escape_tex }}} \\ \vspace{2pt}
+    \small 
+    {% set contact_items = [] %}
+    {% if resume.contact.phone %}{% set _ = contact_items.append(resume.contact.phone | escape_tex) %}{% endif %}
+    {% if resume.contact.email %}{% set _ = contact_items.append(resume.contact.email | escape_tex) %}{% endif %}
+    {% if resume.contact.location %}{% set _ = contact_items.append(resume.contact.location | escape_tex) %}{% endif %}
+    {% if resume.contact.linkedin %}{% set _ = contact_items.append(resume.contact.linkedin | escape_tex) %}{% endif %}
+    {% if resume.contact.github %}{% set _ = contact_items.append(resume.contact.github | escape_tex) %}{% endif %}
+    {% if resume.contact.portfolio %}{% set _ = contact_items.append(resume.contact.portfolio | escape_tex) %}{% endif %}
+    {{ contact_items | join(' $|$ ') }}
+\end{center}
+\vspace{-4pt}
+
+{% if resume.summary %}
+%-----------SUMMARY-----------
+\section{Summary}
+\small{ {{ resume.summary | escape_tex }} }
+\vspace{-2pt}
+{% endif %}
+
+{% if resume.education %}
+%-----------EDUCATION-----------
+\section{Education}
+  \resumeSubHeadingListStart
+    {% for edu in resume.education %}
+      \resumeSubheading
+        { {{ edu.institution | escape_tex }} }{ {{ edu.location | escape_tex }} }
+        { {{ edu.degree | escape_tex }}{% if edu.major %} in {{ edu.major | escape_tex }}{% endif %}{% if edu.cgpa %} (GPA: {{ edu.cgpa | escape_tex }}){% endif %} }{ {{ edu.period | escape_tex }} }
+    {% endfor %}
+  \resumeSubHeadingListEnd
+{% endif %}
+
+{% if resume.experience %}
+%-----------EXPERIENCE-----------
+\section{Experience}
+  \resumeSubHeadingListStart
+    {% for exp in resume.experience %}
+      \resumeSubheading
+        { {{ exp.role | escape_tex }} }{ {{ exp.period | escape_tex }} }
+        { {{ exp.company | escape_tex }} }{ {{ exp.location | escape_tex }} }
+        {% if exp.achievements %}
+          \resumeItemListStart
+            {% for bullet in exp.achievements %}
+              \resumeItem{ {{ bullet | escape_tex }} }
+            {% endfor %}
+          \resumeItemListEnd
+        {% endif %}
+    {% endfor %}
+  \resumeSubHeadingListEnd
+{% endif %}
+
+{% if resume.projects %}
+%-----------PROJECTS-----------
+\section{Projects}
+    \resumeSubHeadingListStart
+      {% for proj in resume.projects %}
+        \resumeProjectHeading
+          {\textbf{ {{ proj.name | escape_tex }} }{% if proj.description %} $|$ \emph{ {{ proj.description | escape_tex }} }{% endif %}{% if proj.stack_str %} $|$ \small\color{MidnightBlue}{ {{ proj.stack_str | escape_tex }} }{% endif %}}{ {{ proj.period | escape_tex }} }
+          {% if proj.highlights %}
+            \resumeItemListStart
+              {% for bullet in proj.highlights %}
+                \resumeItem{ {{ bullet | escape_tex }} }
+              {% endfor %}
+            \resumeItemListEnd
+          {% endif %}
+      {% endfor %}
+    \resumeSubHeadingListEnd
+{% endif %}
+
+{% if resume.skills %}
+%-----------TECHNICAL SKILLS-----------
+\section{Technical Skills}
+ \begin{itemize}[leftmargin=0.15in, label={}, topsep=1pt, partopsep=0pt]
+    \small{\item{
+      {% for group in resume.skills %}
+        \textbf{ {{ group.category | escape_tex }} }: { {{ group.skills | escape_tex }} } \\ \vspace{1pt}
+      {% endfor %}
+    }}
+ \end{itemize}
+ \vspace{-4pt}
+{% endif %}
+
+{% if resume.certifications %}
+%-----------CERTIFICATIONS-----------
+\section{Certifications}
+ \begin{itemize}[leftmargin=0.15in, label={}, topsep=1pt, partopsep=0pt]
+    \small{\item{
+      {% for cert in resume.certifications %}
+        $\bullet$ {{ cert | escape_tex }} \hspace{1em}
+      {% endfor %}
+    }}
+ \end{itemize}
+ \vspace{-4pt}
+{% endif %}
+
+{% if resume.extracurricular %}
+%-----------LEADERSHIP & ACTIVITIES-----------
+\section{Leadership \& Activities}
+  \resumeSubHeadingListStart
+    {% for act in resume.extracurricular %}
+      \resumeSubheading
+        { {{ act.role | escape_tex }} }{ {{ act.period | escape_tex }} }
+        { {{ act.organization | escape_tex }} }{ {{ act.location | escape_tex }} }
+        {% if act.highlights %}
+          \resumeItemListStart
+            {% for bullet in act.highlights %}
+              \resumeItem{ {{ bullet | escape_tex }} }
+            {% endfor %}
+          \resumeItemListEnd
+        {% endif %}
+    {% endfor %}
+  \resumeSubHeadingListEnd
+{% endif %}
+
+\end{document}
