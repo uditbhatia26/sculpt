@@ -143,6 +143,7 @@ class OptimizeResumeRequest(BaseModel):
     jd_cache_id:        Optional[str]   = Field(None,  description="ID of a previously parsed and cached JD. If provided, the LLM JD parse step is skipped.")
     original_ats_score: Optional[float] = Field(None,  description="ATS score already computed by /calculate-ats-detailed. If provided, the original ATS LLM call is skipped.", ge=0, le=100)
     ai_config:          AIProviderConfig = Field(...,  description="BYOK AI provider configuration")
+    template:           Optional[str]   = Field("jakes_resume", description="Target template: jakes_resume | classic_ivy | compact_onepage")
 
 
 # ==================== KEY VALIDATION SCHEMA ====================
@@ -164,6 +165,9 @@ class OptimizedResumeResponse(BaseModel):
     match_level:           str       = Field(description="Excellent/Good/Fair/Poor")
     weekly_usage:          int       = Field(description="Generations used this week after this call")
     weekly_limit:          int       = Field(description="Total allowed generations per week")
+    actual_page_count:     Optional[int] = Field(1, description="Number of compiled PDF pages")
+    iterations_used:       Optional[int] = Field(1, description="Optimization critique iterations executed")
+
 
 
 # ==================== PDF GENERATION SCHEMAS ====================
@@ -174,3 +178,37 @@ class GeneratePDFRequest(BaseModel):
         description="YAML string of the resume to render. If omitted, the user's stored base resume is used.",
         max_length=100_000,
     )
+    template: Optional[str] = Field(
+        "jakes_resume",
+        description="Template identifier: jakes_resume | classic_ivy | compact_onepage",
+    )
+    return_tex: Optional[bool] = Field(
+        False,
+        description="If True, returns the generated raw .tex LaTeX source code instead of compiling to PDF.",
+    )
+
+
+# ==================== EXPLAIN CHANGES SCHEMAS ====================
+
+class BulletChange(BaseModel):
+    section: str = Field(description="Section or role, e.g. 'Product Development Intern @ Supervity' or 'Projects: Postify'")
+    original: Optional[str] = Field(None, description="Original bullet text before optimization (if applicable)")
+    optimized: str = Field(description="Optimized bullet text")
+    reason: str = Field(description="Strategic rationale for the enhancement (e.g. quantified impact, STAR format, woven keywords)")
+
+
+class ChangeExplanationResponse(BaseModel):
+    summary_rationale: Optional[str] = Field(None, description="How the professional summary was repositioned for the role")
+    key_enhancements: List[BulletChange] = Field(default_factory=list, description="Top impactful bullet transformations")
+    skills_strategy: List[str] = Field(default_factory=list, description="Key skills added or prioritized to beat ATS screening")
+    preservation_notes: str = Field(
+        default="Education, degrees, institutions, company names, and dates were strictly preserved from your base resume.",
+        description="Factual guardrail confirmation"
+    )
+
+
+class ExplainChangesRequest(BaseModel):
+    original_yaml: Optional[str] = Field(None, description="Original resume YAML. If omitted, uses current user's base resume.")
+    optimized_yaml: str = Field(..., description="Optimized resume YAML to explain")
+    job_description: Optional[str] = Field(None, description="Target job description")
+    ai_config: Optional[AIProviderConfig] = Field(None, description="Optional BYOK configuration")
