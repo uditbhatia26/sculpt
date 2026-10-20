@@ -32,6 +32,7 @@ Thumbs.db
 
 # Misc
 *.pdf
+bin/
 exp.ipynb
 seed_test_user.py
 .python-version
