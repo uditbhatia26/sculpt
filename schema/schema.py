@@ -1,6 +1,26 @@
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, field_validator
 from typing import Annotated, List, Optional
 from uuid import UUID
+
+VALID_TEMPLATES = ("jakes_resume", "classic_ivy", "compact_onepage")
+MAX_JD_CHARS = 10_000
+
+
+def _validate_uuid(v: Optional[str]) -> Optional[str]:
+    if v is None or v == "":
+        return None
+    try:
+        return str(UUID(str(v)))
+    except ValueError:
+        raise ValueError("jd_cache_id must be a valid UUID")
+
+
+def _validate_template(v: Optional[str]) -> Optional[str]:
+    if v is None or v == "":
+        return None
+    if v not in VALID_TEMPLATES:
+        raise ValueError(f"template must be one of: {', '.join(VALID_TEMPLATES)}")
+    return v
 
 
 # ==================== AI PROVIDER CONFIG (BYOK) ====================
@@ -26,6 +46,15 @@ class UserSignup(BaseModel):
 class UserLogin(BaseModel):
     email:    Annotated[EmailStr, Field(..., description="Email of the user")]
     password: Annotated[str,      Field(..., description="Password of the user")]
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: Annotated[EmailStr, Field(..., description="Email of the account to reset")]
+
+
+class ResetPasswordRequest(BaseModel):
+    token:        Annotated[str, Field(..., min_length=10, max_length=200)]
+    new_password: Annotated[str, Field(..., min_length=6, max_length=128)]
 
 
 class AuthResponse(BaseModel):
@@ -75,9 +104,11 @@ class parsedJobDescription(BaseModel):
 # ==================== ATS SCORING SCHEMAS ====================
 
 class CalculateATS(BaseModel):
-    job_desc:     Annotated[str, Field(..., description="Job Description provided by the user", min_length=50, max_length=20_000)]
+    job_desc:     Annotated[str, Field(..., description="Job Description provided by the user", min_length=50, max_length=MAX_JD_CHARS)]
     jd_cache_id:  Optional[str] = Field(None, description="ID of a previously parsed and cached JD. If provided the LLM parse step is skipped.")
     ai_config:    Optional[AIProviderConfig] = Field(None, description="BYOK AI provider configuration (optional for standard users)")
+
+    _check_cache_id = field_validator("jd_cache_id")(_validate_uuid)
 
 
 
@@ -144,11 +175,14 @@ class DetailedATS(BaseModel):
 # ==================== OPTIMIZATION REQUEST SCHEMAS ====================
 
 class OptimizeResumeRequest(BaseModel):
-    job_desc:           Annotated[str, Field(..., description="Job Description provided by the user", min_length=50, max_length=20_000)]
+    job_desc:           Annotated[str, Field(..., description="Job Description provided by the user", min_length=50, max_length=MAX_JD_CHARS)]
     jd_cache_id:        Optional[str]   = Field(None,  description="ID of a previously parsed and cached JD. If provided, the LLM JD parse step is skipped.")
     original_ats_score: Optional[float] = Field(None,  description="ATS score already computed by /calculate-ats-detailed. If provided, the original ATS LLM call is skipped.", ge=0, le=100)
     ai_config:          Optional[AIProviderConfig] = Field(None, description="BYOK AI provider configuration (optional for standard users)")
-    template:           Optional[str]   = Field("jakes_resume", description="Target template: jakes_resume | classic_ivy | compact_onepage")
+    template:           Optional[str]   = Field(None, description="Target template: jakes_resume | classic_ivy | compact_onepage. Defaults to the user's saved template.")
+
+    _check_cache_id = field_validator("jd_cache_id")(_validate_uuid)
+    _check_template = field_validator("template")(_validate_template)
 
 
 # ==================== KEY VALIDATION SCHEMA ====================
@@ -184,13 +218,15 @@ class GeneratePDFRequest(BaseModel):
         max_length=100_000,
     )
     template: Optional[str] = Field(
-        "jakes_resume",
-        description="Template identifier: jakes_resume | classic_ivy | compact_onepage",
+        None,
+        description="Template identifier: jakes_resume | classic_ivy | compact_onepage. Defaults to the user's saved template.",
     )
     return_tex: Optional[bool] = Field(
         False,
         description="If True, returns the generated raw .tex LaTeX source code instead of compiling to PDF.",
     )
+
+    _check_template = field_validator("template")(_validate_template)
 
 
 # ==================== EXPLAIN CHANGES SCHEMAS ====================
@@ -246,4 +282,4 @@ class UpdateUserBYOKRequest(BaseModel):
 
 
 class UpdateUserPlanRequest(BaseModel):
-    plan: str  # "free" | "pro"
+    plan: str  # "free" | "pro"

@@ -127,3 +127,32 @@ def send_verification_email(to_email: str, full_name: str | None, token: str) ->
     </html>
     """
     return _send(to_email, "Verify your ResumeSculpt email", html)
+
+
+def send_password_reset_email(to_email: str, full_name: str | None, token: str) -> bool:
+    """Send a password-reset link (valid 30 minutes)."""
+    base_url   = os.getenv("APP_BASE_URL", "http://localhost:8000")
+    reset_url  = f"{base_url}/auth/reset-password?token={token}"
+    name_label = full_name or "there"
+    html = f"""
+    <!DOCTYPE html>
+    <html><head><meta charset="utf-8"></head>
+    <body style="font-family:'Segoe UI',Arial,sans-serif;background:#0f1117;margin:0;padding:40px 0;">
+      <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
+        <table width="560" cellpadding="0" cellspacing="0" style="background:#1a1d2e;border-radius:12px;">
+          <tr><td style="padding:40px;">
+            <h2 style="color:#e2e8f0;margin:0 0 16px;">Reset your password, {name_label}</h2>
+            <p style="color:#94a3b8;line-height:1.6;margin:0 0 24px;">
+              We received a request to reset your ResumeSculpt password. This link expires in
+              <strong>30 minutes</strong>. If you didn't ask for this, ignore this email.
+            </p>
+            <a href="{reset_url}" style="display:inline-block;padding:14px 32px;color:#fff;font-weight:600;
+               text-decoration:none;border-radius:8px;background:linear-gradient(135deg,#6c63ff,#a78bfa);">
+              Choose a new password</a>
+            <p style="color:#475569;font-size:12px;margin:24px 0 0;word-break:break-all;">{reset_url}</p>
+          </td></tr>
+        </table>
+      </td></tr></table>
+    </body></html>
+    """
+    return _send(to_email, "Reset your ResumeSculpt password", html)

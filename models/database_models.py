@@ -20,6 +20,10 @@ class User(Base):
     email_verification_token    = Column(String, nullable=True, index=True)      # One-time token sent in email
     email_verification_sent_at  = Column(DateTime(timezone=True), nullable=True) # When last email was sent
 
+    # Password reset (stores a SHA-256 of the emailed token, never the token itself)
+    password_reset_token_hash   = Column(String, nullable=True, index=True)
+    password_reset_expires_at   = Column(DateTime(timezone=True), nullable=True)
+
     # Entitlements & Admin (Pillar 1)
     is_byok_allowed             = Column(Boolean, nullable=False, default=False, server_default="false")
     is_admin                    = Column(Boolean, nullable=False, default=False, server_default="false")

@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form
-from fastapi.responses import StreamingResponse, Response
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form, Request
+from fastapi.responses import StreamingResponse, Response, HTMLResponse
 from typing import Optional, List, Dict, Any
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -11,6 +12,7 @@ from schema.schema import (
     ExplainChangesRequest, ChangeExplanationResponse,
     AdminUserItem, AdminUserListResponse,
     UpdateUserBYOKRequest, UpdateUserPlanRequest,
+    ForgotPasswordRequest, ResetPasswordRequest,
 )
 from dotenv import load_dotenv
 from config.database import get_db, test_connection
@@ -21,21 +23,21 @@ from config.auth import (
     get_current_user
 )
 from models.database_models import User, OptimizedResume, GenerationUsage, ParsedJDCache
-from config.pdf_generator import generate_pdf_from_yaml_string
 from config.latex_generator import (
     render_latex_template,
-    compile_latex_to_pdf,
     generate_pdf_from_resume,
 )
-from config.email import send_verification_email
+from config.email import send_verification_email, send_password_reset_email
+from config.rate_limit import rate_limit
 from io import BytesIO
-from config.resume_functions import ats_detailed, optimize_resume, optimize_resume_agentic, parse_jd, explain_resume_changes
-from models.chains import llm, build_res2yaml_chain
+from config.resume_functions import ats_detailed, optimize_resume_agentic, parse_jd, explain_resume_changes
+from models.chains import build_res2yaml_chain
 from models.llm_factory import build_llm
 import yaml
 from datetime import datetime, timedelta, date
 import os
 import hashlib
+import re
 import secrets
 from PyPDF2 import PdfReader
 import logging
@@ -62,28 +64,60 @@ logging.basicConfig(level=logging.INFO, handlers=[_rotating_handler, _stream_han
 logger = logging.getLogger("Sculpt")
 load_dotenv()
 
-app = FastAPI(title="ResumeSculpt API", version="2.0.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if test_connection():
+        logger.info("[OK] Application started with database connection")
+        try:
+            from init_db import run_migrations
+            run_migrations()
+        except Exception as e:
+            logger.warning(f"Startup migration warning: {e}")
+    else:
+        logger.error("[WARN] Application started but database connection failed")
+    yield
+
+
+app = FastAPI(title="ResumeSculpt API", version="2.0.0", lifespan=lifespan)
+
+MAX_RESUME_CHARS = 12_000
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+
+
+def _cors_origin(request) -> str:
+    """Echo the request origin if allowed. Extensions and localhost are always allowed;
+    set CORS_ORIGINS (comma-separated) to add deployed dashboard origins."""
+    origin = request.headers.get("origin", "")
+    if not origin:
+        return ""
+    if origin.startswith("chrome-extension://") or origin in ALLOWED_ORIGINS:
+        return origin
+    if origin.startswith(("http://localhost", "http://127.0.0.1")):
+        return origin
+    return ""
 
 @app.middleware("http")
 async def cors_and_security_middleware(request, call_next):
+    allow_origin = _cors_origin(request)
     if request.method == "OPTIONS":
-        return Response(
-            status_code=200,
-            headers={
-                "Access-Control-Allow-Origin":  "*",
-                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, *",
-                "Access-Control-Max-Age":        "86400",
-            },
-        )
+        headers = {
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept",
+            "Access-Control-Max-Age":        "86400",
+            "Vary": "Origin",
+        }
+        if allow_origin:
+            headers["Access-Control-Allow-Origin"] = allow_origin
+        return Response(status_code=200, headers=headers)
     response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"]  = "*"
-    # Security headers (L3)
-    response.headers["X-Content-Type-Options"]       = "nosniff"
-    response.headers["X-Frame-Options"]              = "DENY"
-    response.headers["X-XSS-Protection"]             = "1; mode=block"
-    response.headers["Referrer-Policy"]              = "strict-origin-when-cross-origin"
-    response.headers["Content-Security-Policy"]      = "default-src 'none'"
+    if allow_origin:
+        response.headers["Access-Control-Allow-Origin"] = allow_origin
+        response.headers["Vary"] = "Origin"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"]        = "DENY"
+    response.headers["X-XSS-Protection"]       = "1; mode=block"
+    response.headers["Referrer-Policy"]        = "strict-origin-when-cross-origin"
+    response.headers.setdefault("Content-Security-Policy", "default-src 'none'")
     return response
 
 # ==================== PLAN LIMITS ====================
@@ -94,6 +128,19 @@ PLAN_LIMITS = {
 
 
 # ==================== HELPERS ====================
+
+def extract_docx_text(data: bytes) -> str:
+    """Extract paragraph and table text from a .docx file."""
+    from docx import Document
+    doc = Document(BytesIO(data))
+    parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                parts.append(" | ".join(cells))
+    return "\n".join(parts)
+
 
 def get_week_start(today: date = None) -> date:
     """Return the Monday of the current ISO week."""
@@ -378,22 +425,6 @@ def build_auth_response(user: User, access_token: str, db: Session) -> AuthRespo
 
 # ==================== STARTUP ====================
 
-@app.on_event("startup")
-async def startup_event():
-    if test_connection():
-        logger.info("[OK] Application started with database connection")
-        try:
-            from init_db import run_migrations
-            run_migrations()
-        except Exception as e:
-            logger.warning(f"Startup migration warning: {e}")
-    else:
-        logger.error("[WARN] Application started but database connection failed")
-
-
-
-
-
 # ==================== BASIC ENDPOINTS ====================
 
 @app.get('/')
@@ -403,7 +434,8 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "model_loaded": llm is not None}
+    has_server_key = bool(os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY"))
+    return {"status": "OK", "model_loaded": has_server_key}
 
 
 
@@ -421,7 +453,8 @@ def _build_llm_from_config(ai_config):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to initialise AI provider: {e}")
+        logger.warning(f"[LLM RESOLVER] provider init failed: {e}")
+        raise HTTPException(status_code=400, detail="Failed to initialise AI provider. Check the provider name, model and API key.")
 
 
 def resolve_request_llm(
@@ -471,6 +504,14 @@ def resolve_request_llm(
         raise HTTPException(
             status_code=500,
             detail="Server AI is temporarily unavailable (no provider key configured). Please contact support."
+        )
+
+
+def require_verified_email(user: User) -> None:
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Please verify your email address first. Check your inbox for the verification link."
         )
 
 
@@ -542,11 +583,12 @@ async def validate_api_key(
             raise HTTPException(status_code=401, detail="Invalid API key. Please check your key and try again.")
         if any(k in err_str for k in ("quota", "rate", "429", "limit")):
             raise HTTPException(status_code=429, detail="API key is valid but your quota is exhausted.")
-        raise HTTPException(status_code=502, detail=f"Provider error: {e}")
+        logger.warning(f"[VALIDATE KEY] provider error: {e}")
+        raise HTTPException(status_code=502, detail="The AI provider returned an error. Please try again.")
 
 # ==================== AUTHENTICATION ENDPOINTS ====================
 
-@app.post('/auth/signup', response_model=AuthResponse)
+@app.post('/auth/signup', response_model=AuthResponse, dependencies=[Depends(rate_limit('signup', 5, 3600))])
 def create_user(credentials: UserSignup, db: Session = Depends(get_db)):
     """Create a new user account and send a verification email."""
     logger.info(f"Signup attempt for email: {_mask_email(credentials.email)}")
@@ -586,7 +628,7 @@ def create_user(credentials: UserSignup, db: Session = Depends(get_db)):
     return build_auth_response(new_user, access_token, db)
 
 
-@app.post('/auth/login', response_model=AuthResponse)
+@app.post('/auth/login', response_model=AuthResponse, dependencies=[Depends(rate_limit('login', 10, 60))])
 def login_user(credentials: UserLogin, db: Session = Depends(get_db)):
     """Authenticate user and return JWT token."""
     logger.info(f"Login attempt for: {_mask_email(credentials.email)}")
@@ -667,32 +709,12 @@ def refresh_token(
     The existing token must still be valid (not expired).
     Call proactively when < 24h remain to keep sessions alive.
     """
-    weekly_usage  = get_weekly_usage(current_user.id, db)
-    weekly_limit  = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
-    daily_usage   = get_daily_usage(current_user.id, db)
-    monthly_usage = get_monthly_usage(current_user.id, db)
-
     new_token = create_access_token(data={"sub": str(current_user.id)})
-    logger.info(f"[REFRESH] Token refreshed for {current_user.email}")
-
-    return {
-        "access_token":    new_token,
-        "token_type":      "bearer",
-        "user_id":         str(current_user.id),
-        "email":           current_user.email,
-        "full_name":       current_user.full_name,
-        "plan":            current_user.plan,
-        "has_resume":      bool(current_user.resume_yaml),
-        "resume_filename": current_user.resume_filename,
-        "email_verified":  bool(current_user.email_verified),
-        "weekly_usage":    weekly_usage,
-        "weekly_limit":    weekly_limit,
-        "daily_usage":     daily_usage,
-        "monthly_usage":   monthly_usage,
-    }
+    logger.info(f"[REFRESH] Token refreshed for {_mask_email(current_user.email)}")
+    return build_auth_response(current_user, new_token, db)
 
 
-@app.post('/auth/google', response_model=AuthResponse)
+@app.post('/auth/google', response_model=AuthResponse, dependencies=[Depends(rate_limit('google', 20, 60))])
 async def google_auth(payload: dict, db: Session = Depends(get_db)):
     """
     Verify a Google access token (from chrome.identity.getAuthToken) and
@@ -845,11 +867,93 @@ def resend_verification(
     return {"message": "Verification email sent. Please check your inbox."}
 
 
+# ==================== PASSWORD RESET ====================
+
+PASSWORD_RESET_TTL_MINUTES = 30
+
+RESET_PAGE_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reset password - ResumeSculpt</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="font-family:'Segoe UI',Arial,sans-serif;background:#0f1117;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;">
+<form id="f" style="background:#1a1d2e;border-radius:16px;padding:40px;width:340px;color:#e2e8f0;">
+<h1 style="margin:0 0 16px;font-size:22px;">Reset your password</h1>
+<input id="p" type="password" minlength="6" maxlength="128" required placeholder="New password"
+ style="width:100%;box-sizing:border-box;padding:12px;border-radius:8px;border:1px solid #2d3148;background:#0f1117;color:#e2e8f0;margin-bottom:12px;">
+<button style="width:100%;padding:12px;border:0;border-radius:8px;background:linear-gradient(135deg,#6c63ff,#a78bfa);color:#fff;font-weight:600;cursor:pointer;">Set new password</button>
+<p id="m" style="color:#94a3b8;font-size:14px;min-height:20px;"></p>
+</form>
+<script>
+document.getElementById('f').addEventListener('submit', async function(e){
+  e.preventDefault();
+  var m=document.getElementById('m'); m.textContent='Saving...';
+  try{
+    var r=await fetch('/auth/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token:'__TOKEN__',new_password:document.getElementById('p').value})});
+    var d=await r.json();
+    m.textContent = r.ok ? 'Password updated. You can close this tab and log in.' : (d.detail||'Something went wrong.');
+  }catch(err){m.textContent='Network error.';}
+});
+</script></body></html>"""
+
+
+def _hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+@app.post('/auth/forgot-password', dependencies=[Depends(rate_limit('forgot', 5, 3600))])
+def forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Email a password-reset link. Always returns the same message so account existence isn't leaked."""
+    generic = {"message": "If an account exists for that email, a reset link has been sent."}
+    user = db.query(User).filter(User.email == body.email).first()
+    if not user:
+        return generic
+
+    token = secrets.token_urlsafe(32)
+    user.password_reset_token_hash = _hash_reset_token(token)
+    user.password_reset_expires_at = datetime.utcnow() + timedelta(minutes=PASSWORD_RESET_TTL_MINUTES)
+    db.commit()
+
+    try:
+        send_password_reset_email(user.email, user.full_name, token)
+    except Exception as e:
+        logger.warning(f"[EMAIL] Password reset email failed for {_mask_email(user.email)}: {e}")
+    return generic
+
+
+@app.get('/auth/reset-password')
+def reset_password_page(token: str):
+    """Minimal HTML form opened from the reset email."""
+    safe_token = re.sub(r"[^A-Za-z0-9_\-]", "", token)[:200]
+    return HTMLResponse(
+        RESET_PAGE_HTML.replace("__TOKEN__", safe_token),
+        headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'"},
+    )
+
+
+@app.post('/auth/reset-password', dependencies=[Depends(rate_limit('reset', 10, 3600))])
+def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(
+        User.password_reset_token_hash == _hash_reset_token(body.token)
+    ).first()
+    if (
+        not user
+        or not user.password_reset_expires_at
+        or user.password_reset_expires_at.replace(tzinfo=None) < datetime.utcnow()
+    ):
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has expired.")
+
+    user.password_hash = get_password_hash(body.new_password)
+    user.password_reset_token_hash = None
+    user.password_reset_expires_at = None
+    db.commit()
+    logger.info(f"[OK] Password reset for {_mask_email(user.email)}")
+    return {"message": "Password updated. You can now log in."}
+
+
 # ==================== RESUME MANAGEMENT ENDPOINTS ====================
 
 @app.post('/upload-resume')
 async def upload_resume(
-    file:        UploadFile    = File(..., description="Resume PDF file"),
+    file:        UploadFile    = File(..., description="Resume PDF or DOCX file"),
     ai_provider: Optional[str] = Form(None, description="BYOK provider name (openai | anthropic | google | groq | openrouter)"),
     ai_api_key:  Optional[str] = Form(None, description="User's API key for the chosen provider"),
     ai_model:    Optional[str] = Form(None, description="Optional model override"),
@@ -858,7 +962,7 @@ async def upload_resume(
 ):
     """Upload and parse user's resume.
 
-    Multipart form: file (PDF) + optional ai_provider, ai_api_key, ai_model (text fields).
+    Multipart form: file (PDF or DOCX) + optional ai_provider, ai_api_key, ai_model (text fields).
     Replaces any previously uploaded resume.
     """
     logger.info(f"Resume upload for user: {current_user.email}")
@@ -870,48 +974,57 @@ async def upload_resume(
             detail="Please verify your email address before uploading a resume. Check your inbox for the verification link."
         )
 
-    # Validate file type via content-type header
-    if file.content_type != "application/pdf":
+    DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    filename_lc = (file.filename or "").lower()
+    is_docx = file.content_type == DOCX_MIME or filename_lc.endswith(".docx")
+    is_pdf  = file.content_type == "application/pdf"
+    if not (is_pdf or is_docx):
         raise HTTPException(
             status_code=400,
-            detail=f"Only PDF files are allowed. Got: {file.content_type}"
+            detail="Only PDF or DOCX files are allowed."
         )
 
     # Validate file size (2 MB limit) — checked from header first (fast path)
-    PDF_MAX_BYTES = 2 * 1_048_576  # 2 MB
-    if file.size and int(file.size) > PDF_MAX_BYTES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File too large. Maximum 2 MB allowed."
-        )
+    FILE_MAX_BYTES = 2 * 1_048_576  # 2 MB
+    if file.size and int(file.size) > FILE_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="File too large. Maximum 2 MB allowed.")
 
-    # Extract text from PDF
+    # Extract text
     try:
-        pdf_bytes = await file.read()
+        file_bytes = await file.read()
 
         # Re-check size after read (content-type / size header can be spoofed)
-        if len(pdf_bytes) > PDF_MAX_BYTES:
+        if len(file_bytes) > FILE_MAX_BYTES:
             raise HTTPException(status_code=400, detail="File too large. Maximum 2 MB allowed.")
 
-        # Magic-byte check — PDFs always start with "%PDF"
-        if not pdf_bytes.startswith(b"%PDF"):
-            raise HTTPException(status_code=400, detail="Invalid file: not a PDF.")
-
-        reader = PdfReader(BytesIO(pdf_bytes))
-
-        # Guard against malformed / adversarial PDFs with absurd page counts
-        if len(reader.pages) > 50:
-            raise HTTPException(status_code=400, detail="PDF has too many pages (max 50).")
-
-        resume_content = "".join(page.extract_text() or "" for page in reader.pages)
+        if is_docx:
+            # DOCX is a zip archive — magic bytes "PK"
+            if not file_bytes.startswith(b"PK"):
+                raise HTTPException(status_code=400, detail="Invalid file: not a DOCX document.")
+            resume_content = extract_docx_text(file_bytes)
+        else:
+            # PDFs always start with "%PDF"
+            if not file_bytes.startswith(b"%PDF"):
+                raise HTTPException(status_code=400, detail="Invalid file: not a PDF.")
+            reader = PdfReader(BytesIO(file_bytes))
+            # Guard against malformed / adversarial PDFs with absurd page counts
+            if len(reader.pages) > 50:
+                raise HTTPException(status_code=400, detail="PDF has too many pages (max 50).")
+            resume_content = "".join(page.extract_text() or "" for page in reader.pages)
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"PDF read error for {current_user.id}: {e}")
-        raise HTTPException(status_code=400, detail="Failed to read PDF. It may be corrupted or password-protected.")
+        logger.error(f"Resume read error for {current_user.id}: {e}")
+        raise HTTPException(status_code=400, detail="Failed to read the file. It may be corrupted or password-protected.")
+
+    if len(resume_content) > MAX_RESUME_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Resume text is too long ({len(resume_content):,} characters; max {MAX_RESUME_CHARS:,}). Please upload a shorter resume."
+        )
 
     if not resume_content.strip():
-        raise HTTPException(status_code=400, detail="No text found in PDF. Please ensure the resume is not a scanned image.")
+        raise HTTPException(status_code=400, detail="No text found in the file. Please ensure the resume is not a scanned image.")
 
     # Resolve per-request LLM (BYOK if allowed & supplied, else server fallback)
     client_cfg = None
@@ -1183,6 +1296,7 @@ async def optimize_resume_endpoint(
             ai_model=request.ai_config.model       if request.ai_config else None,
         )
         db.add(record)
+        current_user.selected_template = target_template
 
         # ---- Increment weekly usage (only for standard / server-managed generations) ----
         if not is_byok_in_use:
@@ -1272,7 +1386,7 @@ async def explain_changes_endpoint(
         logger.error(f"Error explaining changes for {current_user.id}: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Unable to generate change explanation: {str(e)}"
+            detail="Unable to generate change explanation. Please try again."
         )
 
 
@@ -1316,6 +1430,7 @@ async def download_optimization_pdf(
     db: Session = Depends(get_db),
 ):
     """Re-download a past optimized resume as a PDF by its record ID."""
+    require_verified_email(current_user)
     try:
         rid = uuid.UUID(record_id)
     except ValueError:
@@ -1370,6 +1485,7 @@ async def generate_pdf_endpoint(
     If resume_yaml is omitted, the user's stored base resume is used.
     If return_tex is true, returns the raw LaTeX source code.
     """
+    require_verified_email(current_user)
     # Resolve which YAML to render
     resume_yaml = None
     if body and body.resume_yaml:
@@ -1393,7 +1509,7 @@ async def generate_pdf_endpoint(
             tex_source = render_latex_template(resume_yaml, template_name=template_name)
         except Exception as e:
             logger.error(f"LaTeX rendering error for {current_user.id}: {e}")
-            raise HTTPException(status_code=500, detail=f"LaTeX generation failed: {e}")
+            raise HTTPException(status_code=500, detail="Resume template rendering failed. Please try again or pick another template.")
 
         return Response(
             content=tex_source,
@@ -1408,7 +1524,7 @@ async def generate_pdf_endpoint(
         pdf_bytes = generate_pdf_from_resume(resume_yaml, template=template_name)
     except Exception as e:
         logger.error(f"PDF generation error for {current_user.id}: {e}")
-        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
+        raise HTTPException(status_code=500, detail="PDF generation failed. Please try again.")
 
     logger.info(f"[OK] PDF generated for {current_user.email} using template '{template_name}' ({len(pdf_bytes):,} bytes)")
 
