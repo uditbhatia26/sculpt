@@ -8,14 +8,14 @@ Sculpt's backend is a REST API that handles user authentication, resume storage 
 
 ### Authentication and User Management
 - Email and password signup and login with bcrypt password hashing
-- JWT tokens with a 7-day expiry and a `/auth/refresh` endpoint for silent renewal
+- JWT tokens with a 24-hour expiry and a `/auth/refresh` endpoint for silent renewal
 - Google OAuth support — verifies Google access tokens against the userinfo endpoint and creates or signs in the corresponding user automatically
 - Email verification on signup via a one-time token link (24-hour expiry, 60-second resend throttle)
 - Plan-based access control: `free` and `pro`
 
 ### Resume Upload and Parsing
-- Accepts PDF uploads up to 2 MB and 50 pages
-- Validates files via magic-byte check and content-type header to reject non-PDFs
+- Accepts PDF (up to 50 pages) and DOCX uploads up to 2 MB, with resume text capped at 12,000 characters
+- Validates files via magic-byte check and content type
 - Extracts text via PyPDF2 and converts it to a structured YAML representation using an LLM
 - One active resume stored per user; new uploads replace the previous one
 
@@ -46,7 +46,7 @@ Two scoring modes are available.
 - Computes a semantic diff between the original and optimized resume and returns a structured changelog covering skills added or removed, bullets enhanced per employer, projects added or removed, summary changes, and section-level additions or removals
 
 ### PDF Generation
-- Converts a resume YAML string to a formatted PDF using ReportLab — no system-level dependencies or external binaries required
+- Renders resume YAML through Jinja2 LaTeX templates (`jakes_resume`, `classic_ivy`, `compact_onepage`) and compiles with the bundled Tectonic binary (`bin/`); can also return raw `.tex`. Falls back to ReportLab if compilation is unavailable
 - Accepts the optimized YAML from the request body or falls back to the user's stored base resume if none is provided
 - Streams PDF bytes directly in the response with no intermediate file written to disk
 
@@ -75,6 +75,13 @@ Two scoring modes are available.
 | `GET`  | `/auth/me` | Retrieve profile and current usage stats |
 | `POST` | `/auth/refresh` | Silently renew an expiring JWT |
 | `GET`  | `/auth/verify-email` | Verify email address via one-time token |
+| `POST` | `/auth/forgot-password` | Email a password-reset link (generic response) |
+| `GET` / `POST` | `/auth/reset-password` | Reset form page / set a new password with the emailed token |
+| `DELETE` | `/auth/me` | Permanently delete the account |
+| `POST` | `/validate-key` | Validate a BYOK provider key (entitled users) |
+| `POST` | `/explain-changes` | AI explanation of what changed and why |
+| `GET`  | `/my-optimizations/{id}/pdf` | Re-download a past optimization as PDF |
+| `GET/PATCH` | `/admin/users...` | Admin user list, BYOK and plan toggles |
 | `POST` | `/auth/resend-verification` | Resend the verification email |
 | `POST` | `/upload-resume` | Upload a PDF and parse it to YAML |
 | `GET`  | `/my-resume` | Retrieve the stored resume YAML |
@@ -92,8 +99,30 @@ Two scoring modes are available.
 |---|---|
 | API framework | FastAPI |
 | Database | PostgreSQL via Neon, SQLAlchemy ORM |
-| LLM integration | LangChain with OpenAI GPT and Groq |
-| PDF generation | ReportLab |
+| LLM integration | LangChain: OpenAI, Anthropic, Google, Groq, OpenRouter (server default or user key) |
+| PDF generation | Jinja2 + Tectonic (LaTeX), ReportLab fallback |
+| Workflow | LangGraph (draft → guardrails → page budget → ATS → retry) |
 | PDF text extraction | PyPDF2 |
 | Authentication | bcrypt, python-jose (JWT) |
 | Transactional email | smtplib over Gmail SMTP |
+
+---
+
+## Setup and tests
+
+```bash
+cp .env.example .env   # DATABASE_URL, JWT_SECRET_KEY, OPENAI_API_KEY or GROQ_API_KEY, MAIL_*, APP_BASE_URL
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+Optional env vars: `CORS_ORIGINS` (comma-separated dashboard origins; localhost and `chrome-extension://` are always allowed), `DEBUG_DUMP=true`.
+
+```bash
+python -m unittest tests.test_hardening test_pillar1_byok   # DB-free
+python test_workflow.py                                     # needs Tectonic in bin/
+python test_latex_compilation.py                            # needs Tectonic in bin/
+
+alembic stamp head      # existing database
+alembic upgrade head    # fresh database
+```
