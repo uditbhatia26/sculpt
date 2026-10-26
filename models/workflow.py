@@ -50,7 +50,8 @@ class ResumeOptimizationState(TypedDict, total=False):
     current_resume_yaml: str
     rendered_latex: Optional[str]
     compiled_pdf_bytes: Optional[bytes]
-    actual_page_count: int
+    actual_page_count: Optional[int]
+    compile_error: Optional[str]
 
     # Scores & benchmarks
     original_ats_score: float
@@ -91,6 +92,55 @@ def _normalize_parsed_jd(raw_jd: Any) -> parsedJobDescription:
         skills=getattr(raw_jd, "skills", []),
         job_description=getattr(raw_jd, "job_description", str(raw_jd)),
     )
+
+
+def _target_pages(state: ResumeOptimizationState) -> int:
+    """Page budget: explicit target if set, else 1 for compact_onepage and 2 otherwise."""
+    explicit = state.get("target_page_count")
+    if explicit:
+        return explicit
+    return 1 if state.get("selected_template") == "compact_onepage" else 2
+
+
+def _page_ok(candidate: Dict[str, Any], target_pages: int) -> bool:
+    """A candidate fits the page budget (unknown page count is given the benefit of the doubt)."""
+    pc = candidate.get("page_count")
+    return pc is None or pc <= target_pages
+
+
+def _best_candidate(state: ResumeOptimizationState) -> Optional[Dict[str, Any]]:
+    """Highest-scoring candidate so far, preferring ones inside the page budget."""
+    history = state.get("score_history", [])
+    if not history:
+        return None
+    target_pages = _target_pages(state)
+    fitting = [c for c in history if _page_ok(c, target_pages)]
+    return max(fitting or history, key=lambda c: c.get("score", 0.0))
+
+
+def _flatten_text(yaml_str: str) -> str:
+    """Lower-cased text of a resume for keyword presence checks."""
+    try:
+        data = yaml.safe_load(yaml_str)
+    except Exception:
+        data = None
+    if data is None:
+        return (yaml_str or "").lower()
+
+    parts: List[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                walk(v)
+        elif node is not None:
+            parts.append(str(node))
+
+    walk(data)
+    return " ".join(parts).lower()
 
 
 # ── Workflow Nodes ───────────────────────────────────────────────────────────
@@ -134,6 +184,7 @@ async def node_draft(state: ResumeOptimizationState) -> Dict[str, Any]:
     selected_template = state.get("selected_template", "jakes_resume")
     guidance = TEMPLATE_GUIDANCE.get(selected_template, TEMPLATE_GUIDANCE.get("jakes_resume", ""))
 
+    # Critique notes only describe the previous attempt; they are consumed here
     critique_notes = state.get("critique_notes", [])
     if current_iter > 0 and critique_notes:
         critique_block = (
@@ -149,13 +200,17 @@ async def node_draft(state: ResumeOptimizationState) -> Dict[str, Any]:
     if not llm:
         raise ValueError("LLM instance is required in state for node_draft.")
 
+    # Retry from the best candidate so far (not the latest, possibly regressed, draft)
+    best = _best_candidate(state)
+    base_yaml = best["yaml"] if best else (state.get("current_resume_yaml") or state["original_resume_yaml"])
+
     chain = build_optimization_chain(llm)
     response = await chain.ainvoke(
         input={
             "job_title": parsed_jd_obj.job_title,
             "skills": skills_str,
             "job_description": parsed_jd_obj.job_description,
-            "resume_yaml": state.get("current_resume_yaml") or state["original_resume_yaml"],
+            "resume_yaml": base_yaml,
             "addons": state.get("addons") or "No additional information provided.",
             "template_guidance": guidance,
         }
@@ -175,6 +230,7 @@ async def node_draft(state: ResumeOptimizationState) -> Dict[str, Any]:
     return {
         "current_resume_yaml": optimized_yaml,
         "iteration_count": current_iter,
+        "critique_notes": [],
     }
 
 
@@ -222,14 +278,16 @@ def node_factual_guardrails(state: ResumeOptimizationState) -> Dict[str, Any]:
 
 
 def node_page_budget(state: ResumeOptimizationState) -> Dict[str, Any]:
-    """Node 4: In-memory Tectonic compilation & PDF page budget validation."""
+    """Node 4: In-memory Tectonic compilation & PDF page budget validation (all templates)."""
     selected_template = state.get("selected_template", "jakes_resume")
+    target_pages = _target_pages(state)
     curr_yaml = state.get("current_resume_yaml", "")
     critique_notes = list(state.get("critique_notes", []))
 
     rendered_latex = None
     pdf_bytes = None
-    actual_page_count = 1
+    actual_page_count: Optional[int] = None
+    compile_error: Optional[str] = None
 
     try:
         rendered_latex = render_latex_template(curr_yaml, template_name=selected_template)
@@ -237,16 +295,18 @@ def node_page_budget(state: ResumeOptimizationState) -> Dict[str, Any]:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         actual_page_count = len(reader.pages)
     except Exception as e:
+        # Page count is unknown: record it instead of guessing, and don't penalise the draft for it
         logger.warning(f"[node_page_budget] LaTeX compilation / PDF reading error: {e}")
-        # If compilation failed, attempt fallback page count
-        actual_page_count = 2 if selected_template != "compact_onepage" else 2
+        compile_error = type(e).__name__
 
-    # Validation
-    if selected_template == "compact_onepage" and actual_page_count > 1:
+    if actual_page_count is not None and actual_page_count > target_pages:
         page_budget_passed = False
+        if target_pages == 1:
+            hint = "shorten bullets, trim secondary duties, and guarantee strictly 1-page fit"
+        else:
+            hint = f"tighten wording and drop the weakest bullets so it fits within {target_pages} pages"
         critique_notes.append(
-            f"Compiled PDF was {actual_page_count} pages. For compact_onepage, shorten bullets, "
-            f"trim secondary duties, and guarantee strictly 1-page fit."
+            f"Compiled PDF was {actual_page_count} pages (budget: {target_pages}). For {selected_template}, {hint}."
         )
     else:
         page_budget_passed = True
@@ -255,6 +315,7 @@ def node_page_budget(state: ResumeOptimizationState) -> Dict[str, Any]:
         "rendered_latex": rendered_latex,
         "compiled_pdf_bytes": pdf_bytes,
         "actual_page_count": actual_page_count,
+        "compile_error": compile_error,
         "page_budget_passed": page_budget_passed,
         "critique_notes": critique_notes,
     }
@@ -298,7 +359,7 @@ async def node_ats_evaluator(state: ResumeOptimizationState) -> Dict[str, Any]:
         "score": score,
         "yaml": curr_yaml,
         "latex": state.get("rendered_latex"),
-        "page_count": state.get("actual_page_count", 1),
+        "page_count": state.get("actual_page_count"),
         "details": details,
     })
 
@@ -322,32 +383,23 @@ def node_finalize(state: ResumeOptimizationState) -> Dict[str, Any]:
         final_latex = state.get("rendered_latex")
         final_score = state.get("current_ats_score", state.get("original_ats_score", 0.0))
         is_satisfactory = True
-        actual_page_count = state.get("actual_page_count", 1)
+        actual_page_count = state.get("actual_page_count")
         final_details = state.get("current_ats_details")
     else:
         # Best-effort candidate selector from score_history
         is_satisfactory = False
-        if score_history:
-            if selected_template == "compact_onepage":
-                # Prefer candidates satisfying strictly 1 page
-                one_page_candidates = [c for c in score_history if c.get("page_count", 1) <= 1]
-                if one_page_candidates:
-                    best = max(one_page_candidates, key=lambda c: c.get("score", 0.0))
-                else:
-                    best = max(score_history, key=lambda c: c.get("score", 0.0))
-            else:
-                best = max(score_history, key=lambda c: c.get("score", 0.0))
-
+        best = _best_candidate(state)
+        if best:
             final_yaml = best["yaml"]
             final_latex = best.get("latex")
             final_score = best.get("score", state.get("current_ats_score", 0.0))
-            actual_page_count = best.get("page_count", state.get("actual_page_count", 1))
+            actual_page_count = best.get("page_count")
             final_details = best.get("details")
         else:
             final_yaml = state.get("current_resume_yaml", state.get("original_resume_yaml", ""))
             final_latex = state.get("rendered_latex")
             final_score = state.get("current_ats_score", state.get("original_ats_score", 0.0))
-            actual_page_count = state.get("actual_page_count", 1)
+            actual_page_count = state.get("actual_page_count")
             final_details = state.get("current_ats_details")
 
     # Render latex if not already available
@@ -358,10 +410,23 @@ def node_finalize(state: ResumeOptimizationState) -> Dict[str, Any]:
             logger.warning(f"[node_finalize] Final LaTeX rendering fallback: {e}")
             final_latex = ""
 
-    # Keyword and improvement diffs
-    matched_keywords: List[str] = []
+    # Keywords actually added: JD keywords present in the final resume but absent from the original
+    jd_obj = _normalize_parsed_jd(state.get("parsed_jd"))
+    jd_skills = jd_obj.skills if isinstance(jd_obj.skills, list) else [str(jd_obj.skills)]
+    candidates: List[str] = []
+    seen = set()
+    matched_final: List[str] = []
     if final_details and "keyword_analysis" in final_details:
-        matched_keywords = final_details["keyword_analysis"].get("matched_keywords", [])
+        matched_final = final_details["keyword_analysis"].get("matched_keywords", []) or []
+    for kw in list(jd_skills) + list(matched_final):
+        kw = str(kw).strip()
+        if kw and kw.lower() not in seen:
+            seen.add(kw.lower())
+            candidates.append(kw)
+
+    orig_text = _flatten_text(state.get("original_resume_yaml", ""))
+    final_text = _flatten_text(final_yaml)
+    keywords_added = [kw for kw in candidates if kw.lower() in final_text and kw.lower() not in orig_text]
 
     original_score = state.get("original_ats_score", 0.0)
     score_delta = round(final_score - original_score, 2)
@@ -369,17 +434,22 @@ def node_finalize(state: ResumeOptimizationState) -> Dict[str, Any]:
     improvements_made = [
         f"ATS score moved from {original_score:.1f} to {final_score:.1f} (delta: {score_delta:+.1f})",
     ]
-    if matched_keywords:
-        improvements_made.append(f"Successfully targeted {len(matched_keywords)} matching keywords")
-    if selected_template == "compact_onepage":
-        improvements_made.append(f"Strict 1-page budget validated ({actual_page_count} page)")
+    if keywords_added:
+        improvements_made.append(f"Added {len(keywords_added)} job-description keywords: {', '.join(keywords_added[:10])}")
+    target_pages = _target_pages(state)
+    if actual_page_count is None:
+        improvements_made.append("Page count could not be verified (PDF compile unavailable)")
+    elif actual_page_count <= target_pages:
+        improvements_made.append(f"Page budget met ({actual_page_count} of {target_pages} pages max)")
+    else:
+        improvements_made.append(f"Page budget exceeded ({actual_page_count} pages; target {target_pages}) - best effort result")
 
     return {
         "final_yaml": final_yaml,
         "final_latex": final_latex,
         "current_ats_score": final_score,
         "actual_page_count": actual_page_count,
-        "keywords_added": matched_keywords,
+        "keywords_added": keywords_added,
         "improvements_made": improvements_made,
         "is_satisfactory": is_satisfactory,
     }
