@@ -507,6 +507,18 @@ def resolve_request_llm(
         )
 
 
+def llm_error_to_http(e: Exception, fallback: str) -> HTTPException:
+    """Map a provider exception to a safe, actionable HTTP error (never echoes raw provider text)."""
+    msg = str(e).lower()
+    if "model_not_found" in msg or "does not exist" in msg or "decommissioned" in msg:
+        return HTTPException(status_code=400, detail="The selected AI model isn't available for this provider or key. Check the model name in your AI Provider settings.")
+    if any(k in msg for k in ("invalid_api_key", "incorrect api key", "401", "unauthorized", "authentication")):
+        return HTTPException(status_code=401, detail="The AI provider rejected the API key.")
+    if any(k in msg for k in ("rate limit", "429", "quota", "insufficient_quota", "billing")):
+        return HTTPException(status_code=429, detail="The AI provider is rate-limiting or out of quota. Try again shortly.")
+    return HTTPException(status_code=500, detail=fallback)
+
+
 def require_verified_email(user: User) -> None:
     if not user.email_verified:
         raise HTTPException(
@@ -1384,10 +1396,7 @@ async def explain_changes_endpoint(
         return explanation
     except Exception as e:
         logger.error(f"Error explaining changes for {current_user.id}: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to generate change explanation. Please try again."
-        )
+        raise llm_error_to_http(e, "Unable to generate change explanation. Please try again.")
 
 
 # ==================== HISTORY ENDPOINT ====================
