@@ -1,12 +1,16 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form
 from fastapi.responses import StreamingResponse, Response
+from typing import Optional, List, Dict, Any
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from schema.schema import (
     UserLogin, UserSignup, CalculateATS, AuthResponse,
     DetailedATS, OptimizeResumeRequest, GeneratePDFRequest,
     ValidateKeyRequest, AIProviderConfig,
-    ExplainChangesRequest, ChangeExplanationResponse
+    ExplainChangesRequest, ChangeExplanationResponse,
+    AdminUserItem, AdminUserListResponse,
+    UpdateUserBYOKRequest, UpdateUserPlanRequest,
 )
 from dotenv import load_dotenv
 from config.database import get_db, test_connection
@@ -298,10 +302,20 @@ async def get_or_parse_jd(raw_jd: str, db: Session, llm=None):
 
     # --- Cache miss — call LLM ---
     if llm is None:
-        raise HTTPException(
-            status_code=400,
-            detail="AI provider config is required for first-time job description parsing."
-        )
+        openai_key = os.getenv("OPENAI_API_KEY")
+        groq_key   = os.getenv("GROQ_API_KEY")
+        if openai_key:
+            from langchain_openai import ChatOpenAI
+            llm = ChatOpenAI(api_key=openai_key, model="gpt-4o-mini")
+        elif groq_key:
+            from langchain_groq import ChatGroq
+            llm = ChatGroq(api_key=groq_key, model="llama-3.3-70b-versatile")
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="No AI provider configured on server for first-time job description parsing."
+            )
+
     logger.info(f"[CACHE MISS] Parsing JD via LLM for hash {digest[:12]}...")
     parsed = await parse_jd(job_description=raw_jd, llm=llm)
 
@@ -353,6 +367,8 @@ def build_auth_response(user: User, access_token: str, db: Session) -> AuthRespo
         has_resume=bool(user.resume_yaml),
         resume_filename=user.resume_filename,
         email_verified=bool(user.email_verified),
+        is_byok_allowed=bool(user.is_byok_allowed),
+        is_admin=bool(user.is_admin),
         weekly_usage=weekly_usage,
         weekly_limit=weekly_limit,
         daily_usage=daily_usage,
@@ -366,6 +382,11 @@ def build_auth_response(user: User, access_token: str, db: Session) -> AuthRespo
 async def startup_event():
     if test_connection():
         logger.info("[OK] Application started with database connection")
+        try:
+            from init_db import run_migrations
+            run_migrations()
+        except Exception as e:
+            logger.warning(f"Startup migration warning: {e}")
     else:
         logger.error("[WARN] Application started but database connection failed")
 
@@ -386,7 +407,7 @@ def health():
 
 
 
-# ==================== JD PARSING ENDPOINT ====================
+# ==================== UNIFIED LLM RESOLVER (PILLAR 1) ====================
 
 
 def _build_llm_from_config(ai_config):
@@ -403,6 +424,65 @@ def _build_llm_from_config(ai_config):
         raise HTTPException(status_code=400, detail=f"Failed to initialise AI provider: {e}")
 
 
+def resolve_request_llm(
+    user: User,
+    client_config: Optional[AIProviderConfig],
+    db: Session,
+    enforce_quota: bool = False,
+):
+    """
+    Resolves the LLM instance to use:
+    1. If user is BYOK-entitled AND client_config is provided:
+       Builds LLM with user's key. Bypasses quota check.
+    2. Else (Standard user or no BYOK key provided):
+       If enforce_quota is True:
+           Validates generation quota with check_generation_limit(user, db).
+           Raises HTTP 429 if weekly quota is exceeded.
+       Builds LLM from server environment (OPENAI_API_KEY / GROQ_API_KEY).
+       Raises HTTP 500 if server has no fallback key configured.
+    """
+    # 1. BYOK-entitled user providing custom key
+    if user.is_byok_allowed and client_config and getattr(client_config, "api_key", None):
+        logger.info(f"[LLM RESOLVER] Using BYOK client config ({client_config.provider}) for user {user.email}")
+        return _build_llm_from_config(client_config)
+
+    # 2. Non-entitled user attempting to provide custom key -> reject
+    if not user.is_byok_allowed and client_config and getattr(client_config, "api_key", None):
+        logger.warning(f"[LLM RESOLVER] Non-entitled user {user.email} attempted to provide custom API key")
+        raise HTTPException(
+            status_code=403,
+            detail="BYOK is only available for entitled accounts."
+        )
+
+    # 3. Standard user (or entitled user using server AI) -> enforce quota if requested
+    if enforce_quota:
+        check_generation_limit(user, db)
+
+    # 4. Resolve from server environment
+    openai_key = os.getenv("OPENAI_API_KEY")
+    groq_key   = os.getenv("GROQ_API_KEY")
+
+    if openai_key:
+        return _build_llm_from_config(AIProviderConfig(provider="openai", api_key=openai_key, model="gpt-4o-mini"))
+    elif groq_key:
+        return _build_llm_from_config(AIProviderConfig(provider="groq", api_key=groq_key, model="llama-3.3-70b-versatile"))
+    else:
+        logger.error(f"[LLM RESOLVER] No server fallback key configured for {user.email}")
+        raise HTTPException(
+            status_code=500,
+            detail="Server AI is temporarily unavailable (no provider key configured). Please contact support."
+        )
+
+
+def get_current_admin(current_user: User = Depends(get_current_user)) -> User:
+    """Dependency: Require is_admin == True on current user."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+    return current_user
+
+
+# ==================== JD PARSING ENDPOINT ====================
+
 @app.post('/parse-jd')
 async def parse_job_description(
     request: CalculateATS,
@@ -410,12 +490,11 @@ async def parse_job_description(
     db: Session = Depends(get_db)
 ):
     """Parse and cache a job description. Returns a jd_cache_id the client should
-    pass to /calculate-ats-detailed and /optimize-resume to skip repeated LLM parsing.
-    Requires ai_config (provider + api_key) in the request body."""
+    pass to /calculate-ats-detailed and /optimize-resume to skip repeated LLM parsing."""
     if not request.job_desc.strip():
         raise HTTPException(status_code=400, detail="Job description cannot be empty.")
 
-    request_llm = _build_llm_from_config(request.ai_config)
+    request_llm = resolve_request_llm(current_user, request.ai_config, db, enforce_quota=False)
     parsed, cache_id = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
     logger.info(f"JD parsed/cached for {current_user.email}: cache_id={cache_id}")
     return {
@@ -433,7 +512,13 @@ async def validate_api_key(
     current_user: User = Depends(get_current_user),
 ):
     """Test whether a user-supplied API key is valid by making a minimal single-token
-    completion call to the chosen provider. Returns 200 on success."""
+    completion call to the chosen provider. Gated to BYOK-entitled accounts."""
+    if not current_user.is_byok_allowed:
+        raise HTTPException(
+            status_code=403,
+            detail="BYOK is only available for entitled accounts."
+        )
+
     try:
         test_llm = build_llm(
             provider=request.provider,
@@ -537,6 +622,8 @@ def get_current_user_profile(
         "resume_filename":    current_user.resume_filename,
         "resume_uploaded_at": current_user.resume_uploaded_at.isoformat() if current_user.resume_uploaded_at else None,
         "email_verified":     bool(current_user.email_verified),
+        "is_byok_allowed":    bool(current_user.is_byok_allowed),
+        "is_admin":           bool(current_user.is_admin),
         "weekly_usage":       weekly_usage,
         "weekly_limit":       weekly_limit,
         "daily_usage":        daily_usage,
@@ -762,16 +849,16 @@ def resend_verification(
 
 @app.post('/upload-resume')
 async def upload_resume(
-    file:        UploadFile = File(..., description="Resume PDF file"),
-    ai_provider: str        = Form(None, description="BYOK provider name (openai | anthropic | google | groq | openrouter)"),
-    ai_api_key:  str        = Form(None, description="User's API key for the chosen provider"),
-    ai_model:    str        = Form(None, description="Optional model override"),
+    file:        UploadFile    = File(..., description="Resume PDF file"),
+    ai_provider: Optional[str] = Form(None, description="BYOK provider name (openai | anthropic | google | groq | openrouter)"),
+    ai_api_key:  Optional[str] = Form(None, description="User's API key for the chosen provider"),
+    ai_model:    Optional[str] = Form(None, description="Optional model override"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Upload and parse user's resume.
 
-    Multipart form: file (PDF) + ai_provider, ai_api_key, ai_model (text fields).
+    Multipart form: file (PDF) + optional ai_provider, ai_api_key, ai_model (text fields).
     Replaces any previously uploaded resume.
     """
     logger.info(f"Resume upload for user: {current_user.email}")
@@ -826,17 +913,13 @@ async def upload_resume(
     if not resume_content.strip():
         raise HTTPException(status_code=400, detail="No text found in PDF. Please ensure the resume is not a scanned image.")
 
-    # Validate BYOK config fields (required for the res2yaml LLM call)
-    if not ai_provider or not ai_api_key:
-        raise HTTPException(
-            status_code=400,
-            detail="ai_provider and ai_api_key are required form fields for resume parsing."
-        )
+    # Resolve per-request LLM (BYOK if allowed & supplied, else server fallback)
+    client_cfg = None
+    if ai_provider and ai_api_key:
+        client_cfg = type("_Cfg", (), {"provider": ai_provider, "api_key": ai_api_key, "model": ai_model or None})()
 
-    # Build per-request LLM from user-supplied key
-    upload_llm = _build_llm_from_config(
-        type("_Cfg", (), {"provider": ai_provider, "api_key": ai_api_key, "model": ai_model or None})()
-    )
+    upload_llm = resolve_request_llm(current_user, client_cfg, db, enforce_quota=False)
+
 
     # Parse resume to YAML via AI — wrap so LLM errors surface as 4xx, not 500
     try:
@@ -945,8 +1028,8 @@ async def calculate_ats_detailed(
     if not current_user.resume_yaml:
         raise HTTPException(status_code=404, detail="No resume found. Please upload a resume first.")
 
-    # Build per-request LLM from BYOK config
-    request_llm = _build_llm_from_config(request.ai_config)
+    # Resolve per-request LLM (BYOK if allowed & supplied, else server fallback)
+    request_llm = resolve_request_llm(current_user, request.ai_config, db, enforce_quota=False)
 
     # Use cached parse if the client provided a jd_cache_id
     if request.jd_cache_id:
@@ -1004,8 +1087,9 @@ async def optimize_resume_endpoint(
     if not current_user.resume_yaml:
         raise HTTPException(status_code=404, detail="No resume found. Please upload a resume first.")
 
-    # Build per-request LLM from BYOK config
-    request_llm = _build_llm_from_config(request.ai_config)
+    # Resolve per-request LLM (BYOK if allowed & supplied, else server fallback with quota check)
+    is_byok_in_use = bool(current_user.is_byok_allowed and request.ai_config and getattr(request.ai_config, "api_key", None))
+    request_llm = resolve_request_llm(current_user, request.ai_config, db, enforce_quota=not is_byok_in_use)
 
     # ---- Resolve parsed JD (cache-first) ----
     if request.jd_cache_id:
@@ -1100,9 +1184,13 @@ async def optimize_resume_endpoint(
         )
         db.add(record)
 
-        # ---- Increment weekly usage ----
-        new_count = increment_weekly_usage(current_user.id, db)
+        # ---- Increment weekly usage (only for standard / server-managed generations) ----
+        if not is_byok_in_use:
+            new_count = increment_weekly_usage(current_user.id, db)
+        else:
+            new_count = get_weekly_usage(current_user.id, db)
         db.commit()
+
 
         weekly_limit = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
         logger.info(f"[OK] Optimization complete for {current_user.email}. Iterations: {iterations_used}, Page count: {actual_page_count}, Weekly usage: {new_count}/{weekly_limit}")
@@ -1168,29 +1256,9 @@ async def explain_changes_endpoint(
             detail="Optimized resume YAML is required to explain changes."
         )
 
-    # Resolve LLM: client BYOK first, then server fallback
-    request_llm = None
-    if request.ai_config:
-        try:
-            request_llm = _build_llm_from_config(request.ai_config)
-        except Exception as e:
-            logger.warning(f"Could not build client LLM for {current_user.email}: {e}")
+    # Resolve LLM via unified resolver
+    request_llm = resolve_request_llm(current_user, request.ai_config, db, enforce_quota=False)
 
-    if request_llm is None:
-        openai_key = os.getenv("OPENAI_API_KEY")
-        groq_key = os.getenv("GROQ_API_KEY")
-        if openai_key:
-            from langchain_openai import ChatOpenAI
-            request_llm = ChatOpenAI(api_key=openai_key, model="gpt-4o-mini")
-        elif groq_key:
-            from langchain_groq import ChatGroq
-            request_llm = ChatGroq(api_key=groq_key, model="llama-3.3-70b-versatile")
-
-    if request_llm is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No AI provider configured. Please provide an API key in your Account settings."
-        )
 
     try:
         explanation = await explain_resume_changes(
@@ -1401,5 +1469,110 @@ def admin_cleanup(
         "deleted_files": deleted,
         "errors":        errors,
     }
+
+
+# ==================== ADMIN PORTAL ENDPOINTS (PILLAR 1) ====================
+
+@app.get('/admin/users', response_model=AdminUserListResponse)
+def list_admin_users(
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """List all registered users with their BYOK entitlement, plan, and generation usage."""
+    query = db.query(User)
+    if search and search.strip():
+        term = f"%{search.strip().lower()}%"
+        query = query.filter(
+            or_(
+                func.lower(User.email).like(term),
+                func.lower(func.coalesce(User.full_name, "")).like(term),
+            )
+        )
+
+    total_count = query.count()
+    users = (
+        query.order_by(User.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    user_items = []
+    for u in users:
+        w_used = get_weekly_usage(u.id, db)
+        user_plan = u.plan or "free"
+        w_lim = PLAN_LIMITS.get(user_plan, PLAN_LIMITS["free"])
+        user_items.append(
+            AdminUserItem(
+                user_id=str(u.id),
+                email=u.email,
+                full_name=u.full_name,
+                plan=user_plan,
+                is_byok_allowed=bool(u.is_byok_allowed),
+                is_admin=bool(u.is_admin),
+                email_verified=bool(u.email_verified),
+                weekly_usage=w_used,
+                weekly_limit=w_lim,
+                created_at=u.created_at.isoformat() if u.created_at else None,
+            )
+        )
+
+    return AdminUserListResponse(
+        users=user_items,
+        total_count=total_count,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.patch('/admin/users/{user_id}/byok')
+def update_user_byok(
+    user_id: str,
+    request: UpdateUserBYOKRequest,
+    admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Grant or revoke BYOK entitlement for a user."""
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    target_user.is_byok_allowed = request.is_byok_allowed
+    db.commit()
+    logger.info(f"[ADMIN] {admin.email} set is_byok_allowed={request.is_byok_allowed} for {target_user.email}")
+    return {
+        "message": "User BYOK status updated",
+        "user_id": str(target_user.id),
+        "is_byok_allowed": target_user.is_byok_allowed,
+    }
+
+
+@app.patch('/admin/users/{user_id}/plan')
+def update_user_plan(
+    user_id: str,
+    request: UpdateUserPlanRequest,
+    admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Change a user's subscription tier (free | pro)."""
+    if request.plan not in PLAN_LIMITS:
+        raise HTTPException(status_code=400, detail=f"Invalid plan. Supported: {list(PLAN_LIMITS.keys())}")
+
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    target_user.plan = request.plan
+    db.commit()
+    logger.info(f"[ADMIN] {admin.email} set plan={request.plan} for {target_user.email}")
+    return {
+        "message": "User plan updated",
+        "user_id": str(target_user.id),
+        "plan": target_user.plan,
+    }
+
 
 

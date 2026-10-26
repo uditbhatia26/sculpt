@@ -20,6 +20,10 @@ class User(Base):
     email_verification_token    = Column(String, nullable=True, index=True)      # One-time token sent in email
     email_verification_sent_at  = Column(DateTime(timezone=True), nullable=True) # When last email was sent
 
+    # Entitlements & Admin (Pillar 1)
+    is_byok_allowed             = Column(Boolean, nullable=False, default=False, server_default="false")
+    is_admin                    = Column(Boolean, nullable=False, default=False, server_default="false")
+
     # Resume stored directly on the user (one active resume at a time)
     resume_yaml         = Column(Text, nullable=True)
     resume_latex        = Column(Text, nullable=True)

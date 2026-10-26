@@ -13,6 +13,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def run_migrations():
+    """Apply safe, idempotent column migrations."""
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_byok_allowed BOOLEAN NOT NULL DEFAULT FALSE;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;"))
+            conn.commit()
+            logger.info("[OK] Verified/applied column migrations for users (is_byok_allowed, is_admin)")
+        return True
+    except Exception as e:
+        logger.warning(f"[MIGRATION] Migration note: {e}")
+        return False
+
+
 def init_database():
     """Initialize database by creating all tables."""
     logger.info("[...] Starting database initialization...")
@@ -23,6 +38,7 @@ def init_database():
 
     try:
         Base.metadata.create_all(bind=engine)
+        run_migrations()
         logger.info("[OK] Successfully created all tables:")
         logger.info("   - users               (auth + resume storage)")
         logger.info("   - optimized_resumes   (generation history)")

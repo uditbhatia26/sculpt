@@ -38,6 +38,8 @@ class AuthResponse(BaseModel):
     has_resume:       bool          = Field(description="Whether the user has uploaded a resume")
     resume_filename:  Optional[str] = Field(None, description="Filename of the user's current resume, if any")
     email_verified:   bool          = Field(default=False, description="Whether the user's email has been verified")
+    is_byok_allowed:  bool          = Field(default=False, description="Whether user can use custom API keys")
+    is_admin:         bool          = Field(default=False, description="Whether user has admin privileges")
     weekly_usage:     int           = Field(description="Generations used this week")
     weekly_limit:     int           = Field(description="Max generations allowed per week for their plan")
     daily_usage:      int           = Field(default=0, description="Generations made today")
@@ -53,6 +55,8 @@ class UserProfile(BaseModel):
     has_resume:       bool
     resume_filename:  Optional[str]
     resume_uploaded_at: Optional[str]
+    is_byok_allowed:  bool = False
+    is_admin:         bool = False
     weekly_usage:     int
     weekly_limit:     int
     daily_usage:      int = 0
@@ -73,7 +77,8 @@ class parsedJobDescription(BaseModel):
 class CalculateATS(BaseModel):
     job_desc:     Annotated[str, Field(..., description="Job Description provided by the user", min_length=50, max_length=20_000)]
     jd_cache_id:  Optional[str] = Field(None, description="ID of a previously parsed and cached JD. If provided the LLM parse step is skipped.")
-    ai_config:    AIProviderConfig = Field(..., description="BYOK AI provider configuration")
+    ai_config:    Optional[AIProviderConfig] = Field(None, description="BYOK AI provider configuration (optional for standard users)")
+
 
 
 class ATS(BaseModel):
@@ -142,7 +147,7 @@ class OptimizeResumeRequest(BaseModel):
     job_desc:           Annotated[str, Field(..., description="Job Description provided by the user", min_length=50, max_length=20_000)]
     jd_cache_id:        Optional[str]   = Field(None,  description="ID of a previously parsed and cached JD. If provided, the LLM JD parse step is skipped.")
     original_ats_score: Optional[float] = Field(None,  description="ATS score already computed by /calculate-ats-detailed. If provided, the original ATS LLM call is skipped.", ge=0, le=100)
-    ai_config:          AIProviderConfig = Field(...,  description="BYOK AI provider configuration")
+    ai_config:          Optional[AIProviderConfig] = Field(None, description="BYOK AI provider configuration (optional for standard users)")
     template:           Optional[str]   = Field("jakes_resume", description="Target template: jakes_resume | classic_ivy | compact_onepage")
 
 
@@ -212,3 +217,33 @@ class ExplainChangesRequest(BaseModel):
     optimized_yaml: str = Field(..., description="Optimized resume YAML to explain")
     job_description: Optional[str] = Field(None, description="Target job description")
     ai_config: Optional[AIProviderConfig] = Field(None, description="Optional BYOK configuration")
+
+
+# ==================== ADMIN SCHEMAS (PILLAR 1) ====================
+
+class AdminUserItem(BaseModel):
+    user_id:        str
+    email:          str
+    full_name:      Optional[str] = None
+    plan:           str = "free"
+    is_byok_allowed: bool = False
+    is_admin:       bool = False
+    email_verified: bool = False
+    weekly_usage:   int = 0
+    weekly_limit:   int = 5
+    created_at:     Optional[str] = None
+
+
+class AdminUserListResponse(BaseModel):
+    users:       List[AdminUserItem]
+    total_count: int
+    page:        int
+    page_size:   int
+
+
+class UpdateUserBYOKRequest(BaseModel):
+    is_byok_allowed: bool
+
+
+class UpdateUserPlanRequest(BaseModel):
+    plan: str  # "free" | "pro"
