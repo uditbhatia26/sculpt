@@ -116,13 +116,24 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-Optional env vars: `CORS_ORIGINS` (comma-separated dashboard origins; localhost and `chrome-extension://` are always allowed), `DEBUG_DUMP=true`.
+Optional env vars: `OPTIMIZE_MAX_RETRIES` (0-4, default 2; each retry costs one draft + one ATS LLM call), `ADMIN_CLEANUP_TOKEN` (sent as an `X-Cleanup-Token` header to `DELETE /admin/cleanup`), `CORS_ORIGINS` (comma-separated dashboard origins; localhost and `chrome-extension://` are always allowed), `DEBUG_DUMP=true`.
 
 ```bash
-python -m unittest tests.test_hardening test_pillar1_byok   # DB-free
+python -m unittest tests.test_hardening tests.test_endpoints test_pillar1_byok   # DB-free
 python test_workflow.py                                     # needs Tectonic in bin/
 python test_latex_compilation.py                            # needs Tectonic in bin/
 
 alembic stamp head      # existing database
 alembic upgrade head    # fresh database
 ```
+
+### Docker
+
+```bash
+docker build -t sculpt-api backend
+docker run --env-file backend/.env -p 8000:8000 sculpt-api
+```
+
+The image installs Tectonic for Linux (the bundled `bin/tectonic.exe` is Windows-only). It has not been built in CI yet.
+
+`requirements.txt` lists direct dependencies only; `requirements-lock.txt` is the old full freeze.
