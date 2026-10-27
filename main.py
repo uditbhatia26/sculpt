@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form, Request
+from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form, Request, Header
 from fastapi.responses import StreamingResponse, Response, HTMLResponse
 from typing import Optional, List, Dict, Any
 from sqlalchemy import func, or_
@@ -34,7 +34,7 @@ from config.resume_functions import ats_detailed, optimize_resume_agentic, parse
 from models.chains import build_res2yaml_chain
 from models.llm_factory import build_llm
 import yaml
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 import os
 import hashlib
 import re
@@ -129,6 +129,11 @@ PLAN_LIMITS = {
 
 # ==================== HELPERS ====================
 
+def utcnow() -> datetime:
+    """Naive UTC 'now' (replacement for the deprecated utcnow())."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def extract_docx_text(data: bytes) -> str:
     """Extract paragraph and table text from a .docx file."""
     from docx import Document
@@ -156,6 +161,18 @@ def get_weekly_usage(user_id, db: Session) -> int:
         GenerationUsage.week_start == week_start
     ).first()
     return record.count if record else 0
+
+
+def get_weekly_usage_map(user_ids, db: Session) -> dict:
+    """Weekly generation counts for many users in one query: {user_id: count}."""
+    ids = list(user_ids)
+    if not ids:
+        return {}
+    rows = db.query(GenerationUsage.user_id, GenerationUsage.count).filter(
+        GenerationUsage.user_id.in_(ids),
+        GenerationUsage.week_start == get_week_start(),
+    ).all()
+    return {uid: cnt for uid, cnt in rows}
 
 
 def increment_weekly_usage(user_id, db: Session) -> int:
@@ -620,7 +637,7 @@ def create_user(credentials: UserSignup, db: Session = Depends(get_db)):
         plan="free",
         email_verified=False,
         email_verification_token=verification_token,
-        email_verification_sent_at=datetime.utcnow(),
+        email_verification_sent_at=utcnow(),
     )
     db.add(new_user)
     db.commit()
@@ -807,7 +824,7 @@ def verify_email(token: str, db: Session = Depends(get_db)):
 
     # Check 24-hour expiry
     if user.email_verification_sent_at:
-        age = datetime.utcnow() - user.email_verification_sent_at.replace(tzinfo=None)
+        age = utcnow() - user.email_verification_sent_at.replace(tzinfo=None)
         if age.total_seconds() > 86_400:  # 24 hours
             raise HTTPException(
                 status_code=400,
@@ -857,7 +874,7 @@ def resend_verification(
 
     # Throttle: don't resend if last email was sent less than 60 seconds ago
     if current_user.email_verification_sent_at:
-        age = datetime.utcnow() - current_user.email_verification_sent_at.replace(tzinfo=None)
+        age = utcnow() - current_user.email_verification_sent_at.replace(tzinfo=None)
         if age.total_seconds() < 60:
             wait = int(60 - age.total_seconds())
             raise HTTPException(
@@ -867,7 +884,7 @@ def resend_verification(
 
     token = secrets.token_urlsafe(32)
     current_user.email_verification_token   = token
-    current_user.email_verification_sent_at = datetime.utcnow()
+    current_user.email_verification_sent_at = utcnow()
     db.commit()
 
     try:
@@ -921,7 +938,7 @@ def forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_db)):
 
     token = secrets.token_urlsafe(32)
     user.password_reset_token_hash = _hash_reset_token(token)
-    user.password_reset_expires_at = datetime.utcnow() + timedelta(minutes=PASSWORD_RESET_TTL_MINUTES)
+    user.password_reset_expires_at = utcnow() + timedelta(minutes=PASSWORD_RESET_TTL_MINUTES)
     db.commit()
 
     try:
@@ -949,7 +966,7 @@ def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
     if (
         not user
         or not user.password_reset_expires_at
-        or user.password_reset_expires_at.replace(tzinfo=None) < datetime.utcnow()
+        or user.password_reset_expires_at.replace(tzinfo=None) < utcnow()
     ):
         raise HTTPException(status_code=400, detail="This reset link is invalid or has expired.")
 
@@ -1094,7 +1111,7 @@ async def upload_resume(
     try:
         current_user.resume_yaml        = resume_yaml
         current_user.resume_filename    = file.filename
-        current_user.resume_uploaded_at = datetime.utcnow()
+        current_user.resume_uploaded_at = utcnow()
         db.commit()
         db.refresh(current_user)
     except Exception as e:
@@ -1181,7 +1198,7 @@ async def calculate_ats_detailed(
         return result
     except Exception as e:
         logger.error(f"ATS error for {current_user.id}: {e}")
-        raise HTTPException(status_code=500, detail="Unable to calculate ATS score. Please try again.")
+        raise llm_error_to_http(e, "Unable to calculate ATS score. Please try again.")
 
 
 @app.post('/optimize-resume')
@@ -1195,7 +1212,7 @@ async def optimize_resume_endpoint(
 
     Accepts optional `jd_cache_id` (skip LLM JD parse) and `original_ats_score`
     (skip re-running the original ATS calculation — already done by /calculate-ats-detailed).
-    Requires ai_config (provider + api_key) in the request body.
+    `ai_config` is optional: BYOK-entitled users may pass their own provider key; everyone else uses the server's AI.
     """
     logger.info(f"Resume optimization for user: {current_user.email}")
 
@@ -1354,7 +1371,7 @@ async def optimize_resume_endpoint(
         raise
     except Exception as e:
         logger.error(f"Optimization error for {current_user.id}: {e}")
-        raise HTTPException(status_code=500, detail="Unable to optimize resume. Please try again.")
+        raise llm_error_to_http(e, "Unable to optimize resume. Please try again.")
 
 
 # ==================== EXPLAIN CHANGES ENDPOINT ====================
@@ -1551,8 +1568,8 @@ async def generate_pdf_endpoint(
 
 @app.delete("/admin/cleanup")
 def admin_cleanup(
-    token: str,
     older_than_days: int = 7,
+    x_cleanup_token: Optional[str] = Header(None),
 ):
     """
     Delete debug dump files older than `older_than_days` days from
@@ -1562,11 +1579,12 @@ def admin_cleanup(
     Only relevant when DEBUG_DUMP=true has been used to generate dump files.
 
     Args:
-        token: Must match the ADMIN_CLEANUP_TOKEN environment variable.
+        X-Cleanup-Token header: Must match the ADMIN_CLEANUP_TOKEN environment variable
+            (sent as a header, not a query parameter, so it doesn't end up in access logs).
         older_than_days: Files older than this many days are deleted (default: 7).
     """
     expected = os.getenv("ADMIN_CLEANUP_TOKEN")
-    if not expected or token != expected:
+    if not expected or not x_cleanup_token or not secrets.compare_digest(x_cleanup_token, expected):
         raise HTTPException(status_code=403, detail="Invalid or missing cleanup token.")
 
     if older_than_days < 1:
@@ -1625,9 +1643,10 @@ def list_admin_users(
         .all()
     )
 
+    usage_map = get_weekly_usage_map([u.id for u in users], db)
     user_items = []
     for u in users:
-        w_used = get_weekly_usage(u.id, db)
+        w_used = usage_map.get(u.id, 0)
         user_plan = u.plan or "free"
         w_lim = PLAN_LIMITS.get(user_plan, PLAN_LIMITS["free"])
         user_items.append(
