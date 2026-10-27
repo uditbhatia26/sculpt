@@ -6,6 +6,7 @@ High-level resume processing functions.
 All functions accept a `llm` parameter — a LangChain BaseChatModel built by
 `models.llm_factory.build_llm()` from the user's provider + API key.
 """
+import os
 
 from models.chains import (
     build_jd_parser_chain,
@@ -137,6 +138,13 @@ async def explain_resume_changes(
     return response
 
 
+def _max_retries() -> int:
+    try:
+        return max(0, min(4, int(os.getenv("OPTIMIZE_MAX_RETRIES", "2"))))
+    except ValueError:
+        return 2
+
+
 async def optimize_resume_agentic(
     resume_content: str,
     job_description,
@@ -159,6 +167,8 @@ async def optimize_resume_agentic(
         "llm": llm,
         "addons": addons,
         "original_ats_score": original_ats_score or 0.0,
+        # Each retry costs one draft + one ATS LLM call; cap via OPTIMIZE_MAX_RETRIES (0-4, default 2)
+        "max_retries": _max_retries(),
     }
 
     return await run_resume_optimization_workflow(inputs)
