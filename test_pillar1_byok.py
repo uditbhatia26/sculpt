@@ -248,17 +248,18 @@ class TestPillar1BYOK(unittest.TestCase):
         app.dependency_overrides[get_current_user] = lambda: admin_user
         app.dependency_overrides[get_db] = lambda: mock_db
         try:
-            # 1. Without search
-            resp = self.client.get("/admin/users")
-            self.assertEqual(resp.status_code, 200)
-            data = resp.json()
-            self.assertIn("users", data)
-            self.assertEqual(data["total_count"], 1)
+            with patch("main.get_weekly_usage_map", return_value={}):
+                # 1. Without search
+                resp = self.client.get("/admin/users")
+                self.assertEqual(resp.status_code, 200)
+                data = resp.json()
+                self.assertIn("users", data)
+                self.assertEqual(data["total_count"], 1)
 
-            # 2. With search term (exercises func.lower and or_ in line 1488)
-            resp_search = self.client.get("/admin/users?search=admin")
-            self.assertEqual(resp_search.status_code, 200)
-            self.assertIn("users", resp_search.json())
+                # 2. With search term (exercises func.lower and or_)
+                resp_search = self.client.get("/admin/users?search=admin")
+                self.assertEqual(resp_search.status_code, 200)
+                self.assertIn("users", resp_search.json())
         finally:
             app.dependency_overrides.pop(get_current_user, None)
             app.dependency_overrides.pop(get_db, None)
