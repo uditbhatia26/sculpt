@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+app.log
+debug_resumes/
+optimized_resumes/
+bin/
+seed_test_user.py
+*.pdf
+.git/
