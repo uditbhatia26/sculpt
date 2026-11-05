@@ -169,6 +169,91 @@ class TestOptimize(Base):
         self.assertEqual(res.status_code, 422)
 
 
+class TestFailedGenerationsAreNotCounted(Base):
+    """A generation only consumes quota if a usable result was saved."""
+
+    GOOD = {
+        "final_yaml": "name: Jane\nskills:\n  - Python\n",
+        "final_latex": "tex",
+        "current_ats_score": 82.0,
+        "keywords_added": [],
+        "improvements_made": [],
+        "actual_page_count": 1,
+        "score_history": [{}],
+        "current_ats_details": {"match_level": "Good"},
+    }
+
+    def _optimize(self, workflow, *, byok=False, increment=None):
+        jd = parsedJobDescription(job_title="Eng", skills=["Python"], job_description="d")
+        increment = increment or MagicMock(return_value=1)
+        body = {"job_desc": JD, "original_ats_score": 60}
+        if byok:
+            self.user.is_byok_allowed = True
+            body["ai_config"] = {"provider": "openai", "api_key": "sk-testtesttest"}
+        with patch.object(main, "resolve_request_llm", return_value=object()), \
+             patch.object(main, "get_or_parse_jd", AsyncMock(return_value=(jd, "id"))), \
+             patch.object(main, "optimize_resume_agentic", workflow), \
+             patch.object(main, "increment_weekly_usage", increment), \
+             patch.object(main, "get_weekly_usage", return_value=1), \
+             patch.object(main, "get_daily_usage", return_value=1), \
+             patch.object(main, "get_monthly_usage", return_value=1):
+            res = self.client.post("/optimize-resume", json=body)
+        return res, increment
+
+    def test_success_counts_exactly_once(self):
+        res, inc = self._optimize(AsyncMock(return_value=self.GOOD))
+        self.assertEqual(res.status_code, 200, res.text)
+        inc.assert_called_once()
+        self.db.commit.assert_called_once()
+
+    def test_workflow_exception_is_not_counted_or_saved(self):
+        res, inc = self._optimize(AsyncMock(side_effect=Exception("LLM exploded")))
+        self.assertGreaterEqual(res.status_code, 400)
+        inc.assert_not_called()
+        self.db.add.assert_not_called()
+        self.db.commit.assert_not_called()
+
+    def test_empty_result_is_not_counted_or_saved(self):
+        res, inc = self._optimize(AsyncMock(return_value={**self.GOOD, "final_yaml": "   "}))
+        self.assertEqual(res.status_code, 502)
+        self.assertIn("not counted", res.json()["detail"])
+        inc.assert_not_called()
+        self.db.add.assert_not_called()
+
+    def test_unparseable_result_is_not_counted(self):
+        res, inc = self._optimize(AsyncMock(return_value={**self.GOOD, "final_yaml": "just a sentence"}))
+        self.assertEqual(res.status_code, 502)
+        inc.assert_not_called()
+
+    def test_non_numeric_score_is_not_counted(self):
+        res, inc = self._optimize(AsyncMock(return_value={**self.GOOD, "current_ats_score": None}))
+        self.assertGreaterEqual(res.status_code, 400)
+        inc.assert_not_called()
+
+    def test_commit_failure_rolls_back(self):
+        self.db.commit.side_effect = Exception("db down")
+        res, inc = self._optimize(AsyncMock(return_value=self.GOOD))
+        self.assertEqual(res.status_code, 500)
+        self.db.rollback.assert_called_once()
+
+    def test_byok_generation_never_increments(self):
+        res, inc = self._optimize(AsyncMock(return_value=self.GOOD), byok=True)
+        self.assertEqual(res.status_code, 200, res.text)
+        inc.assert_not_called()
+
+    def test_meter_failure_after_commit_does_not_fail_the_request(self):
+        jd = parsedJobDescription(job_title="Eng", skills=["Python"], job_description="d")
+        with patch.object(main, "resolve_request_llm", return_value=object()), \
+             patch.object(main, "get_or_parse_jd", AsyncMock(return_value=(jd, "id"))), \
+             patch.object(main, "optimize_resume_agentic", AsyncMock(return_value=self.GOOD)), \
+             patch.object(main, "increment_weekly_usage", return_value=1), \
+             patch.object(main, "get_weekly_usage", return_value=1), \
+             patch.object(main, "get_daily_usage", side_effect=Exception("meter down")), \
+             patch.object(main, "get_monthly_usage", return_value=1):
+            res = self.client.post("/optimize-resume", json={"job_desc": JD, "original_ats_score": 60})
+        self.assertEqual(res.status_code, 200, res.text)
+
+
 class TestAdminCleanupToken(Base):
     def test_requires_header_token(self):
         with patch.dict(os.environ, {"ADMIN_CLEANUP_TOKEN": "s3cret"}):

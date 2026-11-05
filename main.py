@@ -210,6 +210,19 @@ def check_generation_limit(user: User, db: Session):
         )
 
 
+def _is_usable_generation(resume_yaml, score) -> bool:
+    """True if the optimizer returned a non-empty YAML mapping and a numeric score."""
+    if not isinstance(resume_yaml, str) or not resume_yaml.strip():
+        return False
+    try:
+        data = yaml.safe_load(resume_yaml)
+    except yaml.YAMLError:
+        return False
+    if not isinstance(data, dict) or not data:
+        return False
+    return isinstance(score, (int, float)) and not isinstance(score, bool)
+
+
 def get_daily_usage(user_id, db: Session) -> int:
     """Count resume generations made today (UTC)."""
     today_start = datetime.combine(date.today(), datetime.min.time())
@@ -1278,6 +1291,15 @@ async def optimize_resume_endpoint(
         optimized_yaml = workflow_result.get("final_yaml", "")
         rendered_latex = workflow_result.get("final_latex")
         optimized_score = workflow_result.get("current_ats_score", original_score_value)
+
+        # A generation only counts if it produced a usable resume. Anything else fails
+        # here, before the record is saved or the weekly counter is touched.
+        if not _is_usable_generation(optimized_yaml, optimized_score):
+            logger.error(f"Optimization produced an unusable result for {current_user.id}; not counted.")
+            raise HTTPException(
+                status_code=502,
+                detail="The AI did not return a usable resume. This attempt was not counted against your limit. Please try again.",
+            )
         keywords_added = workflow_result.get("keywords_added", [])
         improvements_made = workflow_result.get("improvements_made", [])
         actual_page_count = workflow_result.get("actual_page_count", 1)
@@ -1324,15 +1346,20 @@ async def optimize_resume_endpoint(
             ai_provider=request.ai_config.provider if request.ai_config else None,
             ai_model=request.ai_config.model       if request.ai_config else None,
         )
-        db.add(record)
-        current_user.selected_template = target_template
-
-        # ---- Increment weekly usage (only for standard / server-managed generations) ----
-        if not is_byok_in_use:
-            new_count = increment_weekly_usage(current_user.id, db)
-        else:
-            new_count = get_weekly_usage(current_user.id, db)
-        db.commit()
+        # ---- Save the result and (for server-managed AI) count it, in ONE transaction ----
+        # The counter is the last thing written. If anything fails, the rollback discards the
+        # saved record and the increment together, so a failed generation is never counted.
+        try:
+            db.add(record)
+            current_user.selected_template = target_template
+            if not is_byok_in_use:
+                new_count = increment_weekly_usage(current_user.id, db)
+            else:
+                new_count = get_weekly_usage(current_user.id, db)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
 
         weekly_limit = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
@@ -1341,9 +1368,13 @@ async def optimize_resume_endpoint(
         # ---- Compute changelog diff ----
         resume_changes = compute_resume_diff(current_user.resume_yaml, optimized_yaml)
 
-        # ---- Usage stats for the meter ----
-        daily_usage   = get_daily_usage(current_user.id, db)
-        monthly_usage = get_monthly_usage(current_user.id, db)
+        # ---- Usage stats for the meter (best-effort: the generation is already saved and counted) ----
+        try:
+            daily_usage   = get_daily_usage(current_user.id, db)
+            monthly_usage = get_monthly_usage(current_user.id, db)
+        except Exception as meter_err:
+            logger.warning(f"Usage meter lookup failed after a successful generation: {meter_err}")
+            daily_usage = monthly_usage = 0
 
         return {
             "message":                    "Resume optimized successfully",
