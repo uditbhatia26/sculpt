@@ -41,7 +41,8 @@ _fallback_groq_key   = os.getenv("GROQ_API_KEY")
 
 # `llm` is kept for backward compatibility with main.py /health endpoint
 if _fallback_openai_key:
-    llm = ChatOpenAI(api_key=_fallback_openai_key, model="gpt-4o-mini")
+    from models.llm_factory import build_server_llm
+    llm = build_server_llm()
 else:
     llm = None
     logger.warning(
