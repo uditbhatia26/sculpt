@@ -19,4 +19,5 @@ RUN printf '\documentclass{article}\begin{document}warm\end{document}' > /tmp/w.
 
 ENV PORT=8000
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
+# Apply any pending migrations, then start the API
+CMD ["sh", "-c", "python init_db.py && uvicorn main:app --host 0.0.0.0 --port ${PORT}"]

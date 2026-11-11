@@ -1,72 +1,71 @@
 """
-Database Initialization Script
-Creates all tables in the Supabase PostgreSQL database
+Database setup and schema status, driven by Alembic.
+
+    python init_db.py            # bring the database to the latest schema (alembic upgrade head)
+    python init_db.py --status   # show the database revision and whether it is up to date
+
+Schema changes are Alembic migrations in migrations/versions/. To add one:
+    alembic revision --autogenerate -m "describe the change"
+then review the generated file before running it.
 """
 
-from config.database import engine, Base, test_connection
-from models.database_models import User, OptimizedResume, GenerationUsage, ParsedJDCache
 import logging
+import sys
+from pathlib import Path
+
 from dotenv import load_dotenv
+
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+BACKEND_DIR = Path(__file__).resolve().parent
 
-def run_migrations():
-    """Apply safe, idempotent column migrations."""
-    from sqlalchemy import text
+
+def _alembic_config():
+    from alembic.config import Config
+
+    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    return cfg
+
+
+def schema_status() -> tuple:
+    """Return (current_revision, head_revision) for the configured database."""
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+    from config.database import engine
+
+    head = ScriptDirectory.from_config(_alembic_config()).get_current_head()
+    with engine.connect() as conn:
+        current = MigrationContext.configure(conn).get_current_revision()
+    return current, head
+
+
+def check_schema() -> None:
+    """Log a warning at startup if the database isn't on the latest migration. Never raises."""
     try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_byok_allowed BOOLEAN NOT NULL DEFAULT FALSE;"))
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;"))
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_token_hash VARCHAR;"))
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ;"))
-            conn.commit()
-            logger.info("[OK] Verified/applied column migrations for users (is_byok_allowed, is_admin)")
-        return True
+        current, head = schema_status()
+        if current != head:
+            logger.warning(
+                f"[SCHEMA] Database is at revision {current or 'none'}, latest is {head}. "
+                "Run: python init_db.py"
+            )
     except Exception as e:
-        logger.warning(f"[MIGRATION] Migration note: {e}")
-        return False
+        logger.warning(f"[SCHEMA] Could not check the schema revision: {e}")
 
 
-def init_database():
-    """Initialize database by creating all tables."""
-    logger.info("[...] Starting database initialization...")
+def upgrade() -> None:
+    from alembic import command
 
-    if not test_connection():
-        logger.error("[ERROR] Cannot connect to database. Check .env credentials.")
-        return False
-
-    try:
-        Base.metadata.create_all(bind=engine)
-        run_migrations()
-        logger.info("[OK] Successfully created all tables:")
-        logger.info("   - users               (auth + resume storage)")
-        logger.info("   - optimized_resumes   (generation history)")
-        logger.info("   - generation_usage    (weekly paywall tracking)")
-        logger.info("   - parsed_jd_cache     (LLM JD parse cache)")
-        return True
-    except Exception as e:
-        logger.error(f"[ERROR] Failed to create tables: {e}")
-        return False
-
-
-def drop_all_tables():
-    """Drop all tables — use with caution!"""
-    logger.warning("[WARN] Dropping all tables...")
-    try:
-        Base.metadata.drop_all(bind=engine)
-        logger.info("[OK] All tables dropped.")
-        return True
-    except Exception as e:
-        logger.error(f"[ERROR] Failed to drop tables: {e}")
-        return False
+    command.upgrade(_alembic_config(), "head")
 
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--drop":
-        drop_all_tables()
-    init_database()
-    logger.info("[DONE] Database initialization complete!")
+    if "--status" in sys.argv:
+        current, head = schema_status()
+        print(f"database: {current or 'none'}   latest: {head}   {'up to date' if current == head else 'NEEDS UPGRADE'}")
+    else:
+        upgrade()
+        logger.info("[DONE] Database is on the latest schema.")
