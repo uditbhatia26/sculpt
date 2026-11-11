@@ -11,6 +11,10 @@ python-dotenv==1.2.1
 python-jose[cryptography]==3.3.0
 bcrypt>=4.0.1
 httpx==0.28.1
+# The OpenAI SDK's HTTP client (httpx2) decodes Brotli responses with an API added in
+# Brotli 1.2. An older Brotli on the machine breaks every AI call ("process() takes no
+# keyword arguments"), so require a new enough one.
+Brotli>=1.2
 PyPDF2==3.0.1
 python-docx==1.2.0
 Jinja2==3.1.6

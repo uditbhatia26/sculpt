@@ -110,6 +110,7 @@ async def cors_and_security_middleware(request, call_next):
     response = await call_next(request)
     if allow_origin:
         response.headers["Access-Control-Allow-Origin"] = allow_origin
+        response.headers["Access-Control-Expose-Headers"] = "Content-Disposition"
         response.headers["Vary"] = "Origin"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"]        = "DENY"
@@ -143,6 +144,37 @@ def extract_docx_text(data: bytes) -> str:
             if cells:
                 parts.append(" | ".join(cells))
     return "\n".join(parts)
+
+
+def resume_download_filename(resume_yaml: Optional[str], user: Optional["User"] = None, ext: str = "pdf") -> str:
+    """'Jane_Doe_resume.pdf': the name on the resume, falling back to the account's name.
+    Letters and marks (any script), digits, hyphens and apostrophes are kept; spaces become underscores."""
+    name = ""
+    try:
+        data = yaml.safe_load(resume_yaml) if resume_yaml else None
+        if isinstance(data, dict):
+            name = str(data.get("name") or "").strip()
+    except yaml.YAMLError:
+        pass
+    if not name and user is not None:
+        name = (getattr(user, "full_name", None) or "").strip()
+    import unicodedata
+    # Keep letters, digits and combining marks (vowel signs in Devanagari and other scripts)
+    keep = lambda ch: ch.isalnum() or ch in "-'" or unicodedata.category(ch).startswith("M")
+    words = ["".join(ch for ch in w if keep(ch)) for w in name.split()]
+    stem = "_".join(w for w in words if w)[:60]
+    return f"{stem}_resume.{ext}" if stem else f"resume.{ext}"
+
+
+def attachment_header(filename: str) -> str:
+    """Content-Disposition that keeps non-ASCII names intact (RFC 6266 filename*),
+    with an ASCII fallback for clients that only read filename=."""
+    import unicodedata
+    from urllib.parse import quote
+    ext = filename.rsplit(".", 1)[-1]
+    # "María" -> "Maria"; scripts with no Latin form drop out, leaving "resume.pdf"
+    ascii_name = unicodedata.normalize("NFKD", filename).encode("ascii", "ignore").decode().lstrip("_-'") or f"resume.{ext}"
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
 
 
 def get_week_start(today: date = None) -> date:
@@ -1592,14 +1624,13 @@ async def download_optimization_pdf(
         logger.error(f"PDF re-download error for record {record_id}: {e}")
         raise HTTPException(status_code=500, detail="PDF generation failed.")
 
-    safe_title = (record.job_title or "optimized_resume").replace(" ", "_")[:40]
-    filename = f"resume_{safe_title}.pdf"
+    filename = resume_download_filename(record.optimized_yaml, current_user, "pdf")
 
     return StreamingResponse(
         iter([pdf_bytes]),
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": attachment_header(filename),
             "Content-Length": str(len(pdf_bytes)),
         },
     )
@@ -1656,7 +1687,7 @@ async def generate_pdf_endpoint(
             content=tex_source,
             media_type="text/plain; charset=utf-8",
             headers={
-                "Content-Disposition": 'attachment; filename="resume.tex"',
+                "Content-Disposition": attachment_header(resume_download_filename(resume_yaml, current_user, "tex")),
             },
         )
 
@@ -1673,7 +1704,7 @@ async def generate_pdf_endpoint(
         iter([pdf_bytes]),
         media_type="application/pdf",
         headers={
-            "Content-Disposition": 'attachment; filename="optimized_resume.pdf"',
+            "Content-Disposition": attachment_header(resume_download_filename(resume_yaml, current_user, "pdf")),
             "Content-Length": str(len(pdf_bytes)),
         },
     )

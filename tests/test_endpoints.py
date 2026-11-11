@@ -377,3 +377,39 @@ class TestLlmErrorMapping(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDownloadFilenames(Base):
+    """Downloads are named after the person on the resume: Jane_Doe_resume.pdf."""
+
+    YAML = 'name: "Jane Doe"\nskills: [Python]\n'
+
+    def test_pdf_named_after_resume(self):
+        with patch.object(main, "generate_pdf_from_resume", return_value=b"%PDF-1.4"):
+            res = self.client.post("/generate-pdf", json={"resume_yaml": self.YAML},
+                                   headers={"Origin": "http://localhost:5173"})
+        self.assertEqual(res.status_code, 200)
+        self.assertIn('filename="Jane_Doe_resume.pdf"', res.headers["content-disposition"])
+        # the dashboard runs on another origin and can only read the name if it is exposed
+        self.assertEqual(res.headers.get("access-control-expose-headers"), "Content-Disposition")
+
+    def test_tex_named_after_resume(self):
+        with patch.object(main, "render_latex_template", return_value="\documentclass{article}"):
+            res = self.client.post("/generate-pdf", json={"resume_yaml": self.YAML, "return_tex": True})
+        self.assertIn('filename="Jane_Doe_resume.tex"', res.headers["content-disposition"])
+
+    def test_history_redownload_named_after_resume(self):
+        record = MagicMock(optimized_yaml=self.YAML, selected_template="jakes_resume", job_title="Eng")
+        self.db.query.return_value.filter.return_value.first.return_value = record
+        with patch.object(main, "generate_pdf_from_resume", return_value=b"%PDF-1.4"):
+            res = self.client.get(f"/my-optimizations/{uuid.uuid4()}/pdf")
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertIn('filename="Jane_Doe_resume.pdf"', res.headers["content-disposition"])
+
+    def test_name_rules(self):
+        f = main.resume_download_filename
+        self.assertEqual(f('name: "  María  José "'), "María_José_resume.pdf")
+        self.assertEqual(f('name: "../../etc/passwd"'), "etcpasswd_resume.pdf")
+        self.assertEqual(f("skills: [x]", make_user(full_name="Udit Bhatia")), "Udit_Bhatia_resume.pdf")
+        self.assertEqual(f("skills: [x]", make_user(full_name=None), "tex"), "resume.tex")
+        self.assertIn('filename="Maria_Jose_resume.pdf"', main.attachment_header("María_José_resume.pdf"))
