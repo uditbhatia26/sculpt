@@ -116,15 +116,16 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-Optional env vars: `OPTIMIZE_MAX_RETRIES` (0-4, default 2; each retry costs one draft + one ATS LLM call), `ADMIN_CLEANUP_TOKEN` (sent as an `X-Cleanup-Token` header to `DELETE /admin/cleanup`), `CORS_ORIGINS` (comma-separated dashboard origins; localhost and `chrome-extension://` are always allowed), `DEBUG_DUMP=true`.
+Optional env vars: `OPTIMIZE_MAX_RETRIES` (0-4, default 2; each retry costs one draft + one ATS LLM call), `ADMIN_CLEANUP_TOKEN` (sent as an `X-Cleanup-Token` header to `DELETE /admin/cleanup`), `CORS_ORIGINS` (comma-separated dashboard origins; localhost and `chrome-extension://` are always allowed), `DEBUG_DUMP=true`. `GOOGLE_CLIENT_IDS` (comma-separated OAuth client IDs allowed to sign in with Google: the extension's client and the dashboard's web client; defaults to the extension's).
 
 ```bash
 python -m unittest tests.test_hardening tests.test_endpoints test_pillar1_byok   # DB-free
 python test_workflow.py                                     # needs Tectonic in bin/
 python test_latex_compilation.py                            # needs Tectonic in bin/
 
-alembic stamp head      # existing database
-alembic upgrade head    # fresh database
+python init_db.py           # apply migrations (alembic upgrade head)
+python init_db.py --status  # show the database revision
+alembic revision --autogenerate -m "describe the change"   # new migration; review it before running
 ```
 
 ### Docker

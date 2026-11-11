@@ -150,7 +150,7 @@ class TestOptimize(Base):
         with patch.object(main, "resolve_request_llm", return_value=object()), \
              patch.object(main, "get_or_parse_jd", AsyncMock(return_value=(jd, "id"))), \
              patch.object(main, "optimize_resume_agentic", AsyncMock(return_value=workflow_result)), \
-             patch.object(main, "increment_weekly_usage", return_value=1), \
+             patch.object(main, "reserve_generation_slot", return_value=(main.get_week_start(), 1)), \
              patch.object(main, "get_weekly_usage", return_value=1), \
              patch.object(main, "get_daily_usage", return_value=1), \
              patch.object(main, "get_monthly_usage", return_value=1):
@@ -170,7 +170,7 @@ class TestOptimize(Base):
 
 
 class TestFailedGenerationsAreNotCounted(Base):
-    """A generation only consumes quota if a usable result was saved."""
+    """Server AI takes a quota slot up front and gives it back if the generation fails."""
 
     GOOD = {
         "final_yaml": "name: Jane\nskills:\n  - Python\n",
@@ -183,9 +183,10 @@ class TestFailedGenerationsAreNotCounted(Base):
         "current_ats_details": {"match_level": "Good"},
     }
 
-    def _optimize(self, workflow, *, byok=False, increment=None):
+    def _optimize(self, workflow, *, byok=False, reserve=None, daily=None):
         jd = parsedJobDescription(job_title="Eng", skills=["Python"], job_description="d")
-        increment = increment or MagicMock(return_value=1)
+        reserve = reserve or MagicMock(return_value=(main.get_week_start(), 1))
+        release = MagicMock()
         body = {"job_desc": JD, "original_ats_score": 60}
         if byok:
             self.user.is_byok_allowed = True
@@ -193,64 +194,166 @@ class TestFailedGenerationsAreNotCounted(Base):
         with patch.object(main, "resolve_request_llm", return_value=object()), \
              patch.object(main, "get_or_parse_jd", AsyncMock(return_value=(jd, "id"))), \
              patch.object(main, "optimize_resume_agentic", workflow), \
-             patch.object(main, "increment_weekly_usage", increment), \
+             patch.object(main, "reserve_generation_slot", reserve), \
+             patch.object(main, "release_generation_slot", release), \
              patch.object(main, "get_weekly_usage", return_value=1), \
-             patch.object(main, "get_daily_usage", return_value=1), \
+             patch.object(main, "get_daily_usage", daily or MagicMock(return_value=1)), \
              patch.object(main, "get_monthly_usage", return_value=1):
             res = self.client.post("/optimize-resume", json=body)
-        return res, increment
+        return res, reserve, release
 
-    def test_success_counts_exactly_once(self):
-        res, inc = self._optimize(AsyncMock(return_value=self.GOOD))
+    def test_success_takes_one_slot_and_keeps_it(self):
+        res, reserve, release = self._optimize(AsyncMock(return_value=self.GOOD))
         self.assertEqual(res.status_code, 200, res.text)
-        inc.assert_called_once()
+        reserve.assert_called_once()
+        release.assert_not_called()
         self.db.commit.assert_called_once()
+        self.assertEqual(res.json()["weekly_usage"], 1)
 
-    def test_workflow_exception_is_not_counted_or_saved(self):
-        res, inc = self._optimize(AsyncMock(side_effect=Exception("LLM exploded")))
+    def test_workflow_exception_gives_the_slot_back(self):
+        res, reserve, release = self._optimize(AsyncMock(side_effect=Exception("LLM exploded")))
         self.assertGreaterEqual(res.status_code, 400)
-        inc.assert_not_called()
+        release.assert_called_once()
         self.db.add.assert_not_called()
-        self.db.commit.assert_not_called()
 
-    def test_empty_result_is_not_counted_or_saved(self):
-        res, inc = self._optimize(AsyncMock(return_value={**self.GOOD, "final_yaml": "   "}))
+    def test_empty_result_gives_the_slot_back(self):
+        res, _, release = self._optimize(AsyncMock(return_value={**self.GOOD, "final_yaml": "   "}))
         self.assertEqual(res.status_code, 502)
         self.assertIn("not counted", res.json()["detail"])
-        inc.assert_not_called()
+        release.assert_called_once()
         self.db.add.assert_not_called()
 
-    def test_unparseable_result_is_not_counted(self):
-        res, inc = self._optimize(AsyncMock(return_value={**self.GOOD, "final_yaml": "just a sentence"}))
+    def test_unparseable_result_gives_the_slot_back(self):
+        res, _, release = self._optimize(AsyncMock(return_value={**self.GOOD, "final_yaml": "just a sentence"}))
         self.assertEqual(res.status_code, 502)
-        inc.assert_not_called()
+        release.assert_called_once()
 
-    def test_non_numeric_score_is_not_counted(self):
-        res, inc = self._optimize(AsyncMock(return_value={**self.GOOD, "current_ats_score": None}))
+    def test_non_numeric_score_gives_the_slot_back(self):
+        res, _, release = self._optimize(AsyncMock(return_value={**self.GOOD, "current_ats_score": None}))
         self.assertGreaterEqual(res.status_code, 400)
-        inc.assert_not_called()
+        release.assert_called_once()
 
-    def test_commit_failure_rolls_back(self):
+    def test_commit_failure_rolls_back_and_gives_the_slot_back(self):
         self.db.commit.side_effect = Exception("db down")
-        res, inc = self._optimize(AsyncMock(return_value=self.GOOD))
+        res, _, release = self._optimize(AsyncMock(return_value=self.GOOD))
         self.assertEqual(res.status_code, 500)
         self.db.rollback.assert_called_once()
+        release.assert_called_once()
 
-    def test_byok_generation_never_increments(self):
-        res, inc = self._optimize(AsyncMock(return_value=self.GOOD), byok=True)
+    def test_full_week_is_429_and_nothing_runs(self):
+        workflow = AsyncMock(return_value=self.GOOD)
+        full = MagicMock(side_effect=main.HTTPException(status_code=429, detail="Weekly generation limit reached (5/5)."))
+        res, _, release = self._optimize(workflow, reserve=full)
+        self.assertEqual(res.status_code, 429)
+        workflow.assert_not_called()
+        release.assert_not_called()
+
+    def test_byok_generation_never_touches_the_quota(self):
+        res, reserve, release = self._optimize(AsyncMock(return_value=self.GOOD), byok=True)
         self.assertEqual(res.status_code, 200, res.text)
-        inc.assert_not_called()
+        reserve.assert_not_called()
+        release.assert_not_called()
 
-    def test_meter_failure_after_commit_does_not_fail_the_request(self):
-        jd = parsedJobDescription(job_title="Eng", skills=["Python"], job_description="d")
+    def test_meter_failure_after_commit_keeps_the_slot(self):
+        res, _, release = self._optimize(AsyncMock(return_value=self.GOOD),
+                                         daily=MagicMock(side_effect=Exception("meter down")))
+        self.assertEqual(res.status_code, 200, res.text)
+        release.assert_not_called()
+
+
+class TestOneGenerationAtATime(Base):
+    def test_second_request_while_one_runs_is_409(self):
+        main._generations_in_flight.add(str(self.user.id))
+        try:
+            with patch.object(main, "reserve_generation_slot") as reserve:
+                res = self.client.post("/optimize-resume", json={"job_desc": JD, "original_ats_score": 60})
+            self.assertEqual(res.status_code, 409)
+            reserve.assert_not_called()
+        finally:
+            main._generations_in_flight.discard(str(self.user.id))
+
+    def test_guard_is_released_after_a_failure(self):
         with patch.object(main, "resolve_request_llm", return_value=object()), \
-             patch.object(main, "get_or_parse_jd", AsyncMock(return_value=(jd, "id"))), \
-             patch.object(main, "optimize_resume_agentic", AsyncMock(return_value=self.GOOD)), \
-             patch.object(main, "increment_weekly_usage", return_value=1), \
-             patch.object(main, "get_weekly_usage", return_value=1), \
-             patch.object(main, "get_daily_usage", side_effect=Exception("meter down")), \
-             patch.object(main, "get_monthly_usage", return_value=1):
-            res = self.client.post("/optimize-resume", json={"job_desc": JD, "original_ats_score": 60})
+             patch.object(main, "reserve_generation_slot",
+                          side_effect=main.HTTPException(status_code=429, detail="full")):
+            self.client.post("/optimize-resume", json={"job_desc": JD, "original_ats_score": 60})
+        self.assertNotIn(str(self.user.id), main._generations_in_flight)
+
+
+class TestReserveGenerationSlot(unittest.TestCase):
+    """The reservation is one conditional upsert, so it can't overshoot the limit."""
+
+    def test_statement_is_a_conditional_upsert(self):
+        from sqlalchemy.dialects import postgresql
+        db = MagicMock()
+        db.execute.return_value.scalar.return_value = 3
+        week, count = main.reserve_generation_slot(make_user(), db)
+        self.assertEqual(count, 3)
+        sql = str(db.execute.call_args[0][0].compile(dialect=postgresql.dialect()))
+        self.assertIn("ON CONFLICT ON CONSTRAINT uq_generation_usage_user_week DO UPDATE", sql)
+        self.assertIn("WHERE generation_usage.count <", sql)
+        db.commit.assert_called_once()
+
+    def test_full_week_raises_429(self):
+        db = MagicMock()
+        db.execute.return_value.scalar.return_value = None  # no row updated: already at the limit
+        with self.assertRaises(main.HTTPException) as ctx:
+            main.reserve_generation_slot(make_user(), db)
+        self.assertEqual(ctx.exception.status_code, 429)
+
+    def test_release_never_raises(self):
+        db = MagicMock()
+        db.commit.side_effect = Exception("db down")
+        main.release_generation_slot(uuid.uuid4(), main.get_week_start(), db)  # logged, not raised
+
+
+class TestGoogleAuth(Base):
+    def _google(self, tokeninfo, userinfo, status=200):
+        class Resp:
+            def __init__(self, code, body):
+                self.status_code, self._body = code, body
+
+            def json(self):
+                return self._body
+
+        async def fake_get(url, **kw):
+            if "tokeninfo" in url:
+                return Resp(status, tokeninfo)
+            return Resp(200, userinfo)
+
+        client = MagicMock()
+        client.get = fake_get
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        with patch("httpx.AsyncClient", return_value=client), \
+             patch.dict(os.environ, {"GOOGLE_CLIENT_IDS": "ours.apps.googleusercontent.com"}):
+            return self.client.post("/auth/google", json={"access_token": "ya29.test-token"})
+
+    def test_token_for_another_app_is_rejected(self):
+        res = self._google({"aud": "someone-else.apps.googleusercontent.com", "email": "a@b.com"},
+                           {"email": "a@b.com", "verified_email": True})
+        self.assertEqual(res.status_code, 401)
+        self.assertIn("not issued for Sculpt", res.json()["detail"])
+
+    def test_invalid_token_is_rejected(self):
+        res = self._google({"error": "invalid_token"}, {}, status=400)
+        self.assertEqual(res.status_code, 401)
+
+    def test_unverified_google_email_is_rejected(self):
+        res = self._google({"aud": "ours.apps.googleusercontent.com", "email": "a@b.com"},
+                           {"email": "a@b.com", "verified_email": False})
+        self.assertEqual(res.status_code, 403)
+
+    def test_our_token_signs_in(self):
+        existing = make_user(email="a@b.com")
+        self.db.query.return_value.filter.return_value.first.return_value = existing
+        with patch.object(main, "build_auth_response", return_value={
+            "access_token": "jwt", "token_type": "bearer", "user_id": str(existing.id),
+            "email": "a@b.com", "full_name": "A", "plan": "free", "has_resume": True,
+            "weekly_usage": 0, "weekly_limit": 5,
+        }):
+            res = self._google({"aud": "ours.apps.googleusercontent.com", "email": "A@b.com"},
+                               {"email": "a@b.com", "verified_email": True, "name": "A"})
         self.assertEqual(res.status_code, 200, res.text)
 
 

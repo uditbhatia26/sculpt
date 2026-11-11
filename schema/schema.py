@@ -57,6 +57,10 @@ class ResetPasswordRequest(BaseModel):
     new_password: Annotated[str, Field(..., min_length=6, max_length=128)]
 
 
+class GoogleAuthRequest(BaseModel):
+    access_token: str = Field(..., min_length=10, max_length=4096)
+
+
 class AuthResponse(BaseModel):
     access_token:     str           = Field(description="JWT access token")
     token_type:       str           = Field(default="bearer", description="Token type")

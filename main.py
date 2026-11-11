@@ -12,7 +12,7 @@ from schema.schema import (
     ExplainChangesRequest, ChangeExplanationResponse,
     AdminUserItem, AdminUserListResponse,
     UpdateUserBYOKRequest, UpdateUserPlanRequest,
-    ForgotPasswordRequest, ResetPasswordRequest,
+    ForgotPasswordRequest, ResetPasswordRequest, GoogleAuthRequest,
 )
 from dotenv import load_dotenv
 from config.database import get_db, test_connection
@@ -32,7 +32,7 @@ from config.rate_limit import rate_limit
 from io import BytesIO
 from config.resume_functions import ats_detailed, optimize_resume_agentic, parse_jd, explain_resume_changes
 from models.chains import build_res2yaml_chain
-from models.llm_factory import build_llm
+from models.llm_factory import build_llm, build_server_llm, PROVIDER_DEFAULTS, SERVER_PROVIDER_ORDER
 import yaml
 from datetime import datetime, timedelta, date, timezone
 import os
@@ -68,11 +68,9 @@ load_dotenv()
 async def lifespan(_app: FastAPI):
     if test_connection():
         logger.info("[OK] Application started with database connection")
-        try:
-            from init_db import run_migrations
-            run_migrations()
-        except Exception as e:
-            logger.warning(f"Startup migration warning: {e}")
+        # Schema changes are Alembic migrations, applied with `python init_db.py`
+        from init_db import check_schema
+        check_schema()
     else:
         logger.error("[WARN] Application started but database connection failed")
     yield
@@ -148,8 +146,8 @@ def extract_docx_text(data: bytes) -> str:
 
 
 def get_week_start(today: date = None) -> date:
-    """Return the Monday of the current ISO week."""
-    d = today or date.today()
+    """Return the Monday of the current ISO week (UTC)."""
+    d = today or datetime.now(timezone.utc).date()
     return d - timedelta(days=d.weekday())
 
 
@@ -175,27 +173,77 @@ def get_weekly_usage_map(user_ids, db: Session) -> dict:
     return {uid: cnt for uid, cnt in rows}
 
 
-def increment_weekly_usage(user_id, db: Session) -> int:
-    """Increment the weekly generation counter and return new count."""
+def reserve_generation_slot(user: User, db: Session) -> tuple[date, int]:
+    """Atomically take one generation from this week's quota and return (week_start, new_count).
+
+    One INSERT ... ON CONFLICT DO UPDATE ... WHERE count < limit statement, so two requests
+    can never both pass the check and overshoot the limit, and the first request of a week
+    can't collide on the unique (user_id, week_start) row. Raises 429 when the week is full.
+    The slot is committed immediately; call release_generation_slot() if the generation fails.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
     week_start = get_week_start()
-    record = db.query(GenerationUsage).filter(
-        GenerationUsage.user_id == user_id,
-        GenerationUsage.week_start == week_start
-    ).first()
-
-    if record:
-        record.count += 1
-    else:
-        record = GenerationUsage(
-            id=uuid.uuid4(),
-            user_id=user_id,
-            week_start=week_start,
-            count=1
+    limit = PLAN_LIMITS.get(user.plan, PLAN_LIMITS["free"])
+    stmt = pg_insert(GenerationUsage).values(
+        id=uuid.uuid4(), user_id=user.id, week_start=week_start, count=1,
+    )
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_generation_usage_user_week",
+        set_={"count": GenerationUsage.count + 1, "updated_at": func.now()},
+        where=GenerationUsage.count < limit,
+    ).returning(GenerationUsage.count)
+    try:
+        new_count = db.execute(stmt).scalar()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    if new_count is None:
+        # The row exists and is already at the limit: nothing was updated.
+        raise HTTPException(
+            status_code=429,
+            detail=f"Weekly generation limit reached ({limit}/{limit}). "
+                   f"{'Upgrade to Pro for 30 generations/week.' if user.plan == 'free' else 'Limit resets every Monday.'}"
         )
-        db.add(record)
+    return week_start, new_count
 
-    db.flush()
-    return record.count
+
+def release_generation_slot(user_id, week_start: date, db: Session) -> None:
+    """Give back a slot taken by reserve_generation_slot() when the generation failed.
+    Best-effort: a failure here is logged, never raised over the original error."""
+    try:
+        db.rollback()  # discard anything the failed request left pending
+        db.query(GenerationUsage).filter(
+            GenerationUsage.user_id == user_id,
+            GenerationUsage.week_start == week_start,
+            GenerationUsage.count > 0,
+        ).update({GenerationUsage.count: GenerationUsage.count - 1}, synchronize_session=False)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[QUOTA] Could not release a generation slot for {user_id}: {e}")
+
+
+# Users with a generation running in this worker. A second click while one is running gets a
+# 409 instead of starting (and paying for) a duplicate. Quota correctness doesn't depend on
+# this: reserve_generation_slot() is atomic in the database across workers.
+_generations_in_flight: set = set()
+
+
+@asynccontextmanager
+async def single_generation(user_id):
+    key = str(user_id)
+    if key in _generations_in_flight:
+        raise HTTPException(
+            status_code=409,
+            detail="A resume is already being generated for this account. Wait for it to finish.",
+        )
+    _generations_in_flight.add(key)
+    try:
+        yield
+    finally:
+        _generations_in_flight.discard(key)
 
 
 def check_generation_limit(user: User, db: Session):
@@ -379,15 +427,8 @@ async def get_or_parse_jd(raw_jd: str, db: Session, llm=None):
 
     # --- Cache miss — call LLM ---
     if llm is None:
-        openai_key = os.getenv("OPENAI_API_KEY")
-        groq_key   = os.getenv("GROQ_API_KEY")
-        if openai_key:
-            from langchain_openai import ChatOpenAI
-            llm = ChatOpenAI(api_key=openai_key, model="gpt-4o-mini")
-        elif groq_key:
-            from langchain_groq import ChatGroq
-            llm = ChatGroq(api_key=groq_key, model="llama-3.3-70b-versatile")
-        else:
+        llm = build_server_llm()
+        if llm is None:
             raise HTTPException(
                 status_code=500,
                 detail="No AI provider configured on server for first-time job description parsing."
@@ -522,19 +563,16 @@ def resolve_request_llm(
         check_generation_limit(user, db)
 
     # 4. Resolve from server environment
-    openai_key = os.getenv("OPENAI_API_KEY")
-    groq_key   = os.getenv("GROQ_API_KEY")
+    for provider, env in SERVER_PROVIDER_ORDER:
+        key = os.getenv(env)
+        if key:
+            return _build_llm_from_config(AIProviderConfig(provider=provider, api_key=key, model=PROVIDER_DEFAULTS[provider]))
 
-    if openai_key:
-        return _build_llm_from_config(AIProviderConfig(provider="openai", api_key=openai_key, model="gpt-4o-mini"))
-    elif groq_key:
-        return _build_llm_from_config(AIProviderConfig(provider="groq", api_key=groq_key, model="llama-3.3-70b-versatile"))
-    else:
-        logger.error(f"[LLM RESOLVER] No server fallback key configured for {user.email}")
-        raise HTTPException(
-            status_code=500,
-            detail="Server AI is temporarily unavailable (no provider key configured). Please contact support."
-        )
+    logger.error(f"[LLM RESOLVER] No server fallback key configured for {user.email}")
+    raise HTTPException(
+        status_code=500,
+        detail="Server AI is temporarily unavailable (no provider key configured). Please contact support."
+    )
 
 
 def llm_error_to_http(e: Exception, fallback: str) -> HTTPException:
@@ -610,7 +648,7 @@ async def validate_api_key(
         )
         # Minimal test call — ask for a single word so token usage is near-zero
         await test_llm.ainvoke("Reply with the single word OK")
-        from models.llm_factory import PROVIDER_LABELS, PROVIDER_DEFAULTS
+        from models.llm_factory import PROVIDER_LABELS
         resolved_model = request.model or PROVIDER_DEFAULTS.get(request.provider.lower(), "")
         return {
             "valid":    True,
@@ -756,41 +794,73 @@ def refresh_token(
     return build_auth_response(current_user, new_token, db)
 
 
+# OAuth client IDs whose Google tokens may sign in to Sculpt: the Chrome extension's client
+# (manifest.json oauth2.client_id) plus the dashboard's web client. Override with
+# GOOGLE_CLIENT_IDS (comma-separated). Client IDs are public, not secrets.
+DEFAULT_GOOGLE_CLIENT_IDS = "551941315184-9mf9khph2hkv1v7k89m0ngidh83nh2v7.apps.googleusercontent.com"
+
+
+def allowed_google_client_ids() -> set:
+    raw = os.getenv("GOOGLE_CLIENT_IDS") or DEFAULT_GOOGLE_CLIENT_IDS
+    return {c.strip() for c in raw.split(",") if c.strip()}
+
+
 @app.post('/auth/google', response_model=AuthResponse, dependencies=[Depends(rate_limit('google', 20, 60))])
-async def google_auth(payload: dict, db: Session = Depends(get_db)):
+async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
     """
-    Verify a Google access token (from chrome.identity.getAuthToken) and
-    return a ResumeSculpt session JWT.
-    The extension sends: { access_token }
-    No client secret needed — Chrome Extension OAuth type handles auth on Google's side.
+    Exchange a Google OAuth access token for a Sculpt session JWT.
+    Used by the extension (chrome.identity.getAuthToken) and the dashboard (Google Identity
+    Services token client). The token must have been issued to one of OUR client IDs:
+    without that check, any app the user once signed in to with Google could replay its
+    token here and log in as them.
     """
     import httpx
 
-    google_access_token = payload.get("access_token")
-    if not google_access_token:
-        raise HTTPException(status_code=400, detail="access_token is required.")
+    google_access_token = payload.access_token
 
-    # ── Step 1: Verify token and fetch user profile from Google ─────────────
-    async with httpx.AsyncClient() as client:
-        profile_res = await client.get(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {google_access_token}"},
-        )
+    # ── Step 1: Verify the token was issued to Sculpt, then read the profile ──
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            info_res = await client.get(
+                "https://oauth2.googleapis.com/tokeninfo",
+                params={"access_token": google_access_token},
+            )
+            if info_res.status_code != 200:
+                logger.warning(f"[GOOGLE] tokeninfo rejected the token: {info_res.status_code}")
+                raise HTTPException(status_code=401, detail="Invalid or expired Google access token.")
+            info = info_res.json()
+            audience = info.get("aud") or info.get("azp")
+            if audience not in allowed_google_client_ids():
+                logger.warning(f"[GOOGLE] Token issued to an unknown client: {audience}")
+                raise HTTPException(status_code=401, detail="This Google token was not issued for Sculpt.")
+
+            profile_res = await client.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": f"Bearer {google_access_token}"},
+            )
+    except httpx.HTTPError as e:
+        logger.error(f"[GOOGLE] Could not reach Google: {e}")
+        raise HTTPException(status_code=503, detail="Could not reach Google. Please try again.")
 
     if profile_res.status_code != 200:
-        logger.error(f"[GOOGLE] Token verification failed: {profile_res.text}")
+        logger.error(f"[GOOGLE] userinfo failed: {profile_res.status_code}")
         raise HTTPException(status_code=401, detail="Invalid or expired Google access token.")
 
     profile         = profile_res.json()
-    google_email    = profile.get("email")
+    google_email    = (profile.get("email") or "").strip().lower()
     google_name     = profile.get("name")
-    google_verified = profile.get("verified_email", False)
+    google_verified = bool(profile.get("verified_email", False))
 
     if not google_email:
         raise HTTPException(status_code=400, detail="Could not retrieve email from Google.")
+    if google_email != (info.get("email") or "").strip().lower():
+        raise HTTPException(status_code=401, detail="Google token and profile do not match.")
+    if not google_verified:
+        # Never link (or create) an account from an email Google itself hasn't verified
+        raise HTTPException(status_code=403, detail="Your Google email address isn't verified with Google.")
 
     # ── Step 2: Find or create user ─────────────────────────────────────────
-    user = db.query(User).filter(User.email == google_email).first()
+    user = db.query(User).filter(func.lower(User.email) == google_email).first()
 
     if not user:
         # New user — set a random unusable password (OAuth users sign in via Google)
@@ -1242,10 +1312,27 @@ async def optimize_resume_endpoint(
     if not current_user.resume_yaml:
         raise HTTPException(status_code=404, detail="No resume found. Please upload a resume first.")
 
-    # Resolve per-request LLM (BYOK if allowed & supplied, else server fallback with quota check)
-    is_byok_in_use = bool(current_user.is_byok_allowed and request.ai_config and getattr(request.ai_config, "api_key", None))
-    request_llm = resolve_request_llm(current_user, request.ai_config, db, enforce_quota=not is_byok_in_use)
+    # One generation at a time per account (a double-click gets a 409, not a second run)
+    async with single_generation(current_user.id):
+        # Resolve per-request LLM (BYOK if allowed & supplied, else the server's AI)
+        is_byok_in_use = bool(current_user.is_byok_allowed and request.ai_config and getattr(request.ai_config, "api_key", None))
+        request_llm = resolve_request_llm(current_user, request.ai_config, db, enforce_quota=False)
 
+        # Server AI: take a slot from the weekly quota atomically, up front. It is given back
+        # if the generation fails, so a failed generation never counts.
+        slot = None if is_byok_in_use else reserve_generation_slot(current_user, db)
+        state = {"saved": False}
+        try:
+            return await _run_optimization(request, current_user, db, request_llm, slot, state)
+        except BaseException:
+            if slot and not state["saved"]:
+                release_generation_slot(current_user.id, slot[0], db)
+            raise
+
+
+async def _run_optimization(request, current_user: User, db: Session, request_llm, slot, state: dict):
+    """The optimization itself. `slot` is the reserved (week_start, count) for server AI, or None
+    for BYOK. Sets state["saved"] once the result is committed."""
     # ---- Resolve parsed JD (cache-first) ----
     if request.jd_cache_id:
         cached = db.query(ParsedJDCache).filter(
@@ -1346,20 +1433,17 @@ async def optimize_resume_endpoint(
             ai_provider=request.ai_config.provider if request.ai_config else None,
             ai_model=request.ai_config.model       if request.ai_config else None,
         )
-        # ---- Save the result and (for server-managed AI) count it, in ONE transaction ----
-        # The counter is the last thing written. If anything fails, the rollback discards the
-        # saved record and the increment together, so a failed generation is never counted.
+        # ---- Save the result. The quota slot was already taken atomically by the caller;
+        # if this commit fails, the caller gives the slot back. ----
         try:
             db.add(record)
             current_user.selected_template = target_template
-            if not is_byok_in_use:
-                new_count = increment_weekly_usage(current_user.id, db)
-            else:
-                new_count = get_weekly_usage(current_user.id, db)
             db.commit()
         except Exception:
             db.rollback()
             raise
+        state["saved"] = True
+        new_count = slot[1] if slot else get_weekly_usage(current_user.id, db)
 
 
         weekly_limit = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
