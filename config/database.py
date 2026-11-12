@@ -36,7 +36,10 @@ engine = create_engine(
     echo=False,
 )
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# expire_on_commit=False: after a commit, keep the loaded values instead of expiring them.
+# Expired objects reload on the next attribute read, which in an async endpoint is a hidden
+# blocking query (about 300 ms to Neon) on the event loop.
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
 Base = declarative_base()
 
 
@@ -59,4 +62,4 @@ def test_connection():
         return True
     except Exception as e:
         logger.error(f"[ERROR] Failed to connect to Neon database: {str(e)}")
-        return False
+        return False

@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import asyncio
+from starlette.concurrency import run_in_threadpool
 from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form, Request, Header
 from fastapi.responses import StreamingResponse, Response, HTMLResponse
 from typing import Optional, List, Dict, Any
@@ -33,6 +35,7 @@ from io import BytesIO
 from config.resume_functions import ats_detailed, optimize_resume_agentic, parse_jd, explain_resume_changes
 from models.chains import build_res2yaml_chain
 from models.llm_factory import build_llm, build_server_llm, PROVIDER_DEFAULTS, SERVER_PROVIDER_ORDER
+from profile_routes import router as profile_router, onboarding_state, build_profile_addons
 import yaml
 from datetime import datetime, timedelta, date, timezone
 import os
@@ -77,6 +80,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="ResumeSculpt API", version="2.0.0", lifespan=lifespan)
+app.include_router(profile_router)  # profile pool, onboarding, GitHub connection, Chisel
 
 MAX_RESUME_CHARS = 12_000
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
@@ -175,6 +179,23 @@ def attachment_header(filename: str) -> str:
     # "María" -> "Maria"; scripts with no Latin form drop out, leaving "resume.pdf"
     ascii_name = unicodedata.normalize("NFKD", filename).encode("ascii", "ignore").decode().lstrip("_-'") or f"resume.{ext}"
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def extract_resume_text(file_bytes: bytes, is_docx: bool) -> str:
+    """Text of an uploaded resume. Raises HTTPException(400) for a file that isn't what it claims."""
+    if is_docx:
+        # DOCX is a zip archive: magic bytes "PK"
+        if not file_bytes.startswith(b"PK"):
+            raise HTTPException(status_code=400, detail="Invalid file: not a DOCX document.")
+        return extract_docx_text(file_bytes)
+    # PDFs always start with "%PDF"
+    if not file_bytes.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Invalid file: not a PDF.")
+    reader = PdfReader(BytesIO(file_bytes))
+    # Guard against malformed / adversarial PDFs with absurd page counts
+    if len(reader.pages) > 50:
+        raise HTTPException(status_code=400, detail="PDF has too many pages (max 50).")
+    return "".join(page.extract_text() or "" for page in reader.pages)
 
 
 def get_week_start(today: date = None) -> date:
@@ -427,48 +448,29 @@ def jd_hash(raw_jd: str) -> str:
     return hashlib.sha256(raw_jd.strip().lower().encode("utf-8")).hexdigest()
 
 
-async def get_or_parse_jd(raw_jd: str, db: Session, llm=None):
-    """Return a cached parsedJobDescription for this JD, calling the LLM only on a cache miss.
+def _parsed_from_cache_row(row: ParsedJDCache):
+    from schema.schema import parsedJobDescription
+    return parsedJobDescription(
+        job_title=row.job_title or "",
+        skills=row.skills or [],
+        job_description=row.job_description,
+    )
 
-    Parameters
-    ----------
-    raw_jd : str
-        The raw job description text.
-    db : Session
-        SQLAlchemy DB session.
-    llm : BaseChatModel | None
-        Per-request LangChain LLM built from user's BYOK config.
-        Required on cache misses. If None and a cache miss occurs, raises 400.
 
-    Returns:
-        tuple[parsedJobDescription, str]: (parsed_jd object, cache_id string)
-    """
-    digest = jd_hash(raw_jd)
+def load_cached_jd(db: Session, cache_id) -> Optional["parsedJobDescription"]:
+    """The parsed JD stored under a jd_cache_id, or None. Blocking: call via run_in_threadpool."""
+    row = db.query(ParsedJDCache).filter(ParsedJDCache.id == cache_id).first()
+    return _parsed_from_cache_row(row) if row else None
 
-    # --- Cache hit ---
-    cached = db.query(ParsedJDCache).filter(ParsedJDCache.jd_hash == digest).first()
-    if cached:
-        logger.info(f"[CACHE HIT] JD parse cache hit for hash {digest[:12]}...")
-        from schema.schema import parsedJobDescription
-        parsed = parsedJobDescription(
-            job_title=cached.job_title or "",
-            skills=cached.skills or [],
-            job_description=cached.job_description,
-        )
-        return parsed, str(cached.id)
 
-    # --- Cache miss — call LLM ---
-    if llm is None:
-        llm = build_server_llm()
-        if llm is None:
-            raise HTTPException(
-                status_code=500,
-                detail="No AI provider configured on server for first-time job description parsing."
-            )
+def _jd_cache_lookup(db: Session, digest: str):
+    row = db.query(ParsedJDCache).filter(ParsedJDCache.jd_hash == digest).first()
+    return (_parsed_from_cache_row(row), str(row.id)) if row else None
 
-    logger.info(f"[CACHE MISS] Parsing JD via LLM for hash {digest[:12]}...")
-    parsed = await parse_jd(job_description=raw_jd, llm=llm)
 
+def _jd_cache_store(db: Session, digest: str, parsed):
+    """Save a parse and return (parsed, cache_id). If another request stored the same JD
+    first (the unique jd_hash makes the INSERT fail), return that row instead."""
     record = ParsedJDCache(
         id=uuid.uuid4(),
         jd_hash=digest,
@@ -479,26 +481,65 @@ async def get_or_parse_jd(raw_jd: str, db: Session, llm=None):
     db.add(record)
     try:
         db.commit()
-        db.refresh(record)
+        return parsed, str(record.id)
     except IntegrityError:
-        # Another concurrent request inserted the same jd_hash between our
-        # cache-miss check and this INSERT (TOCTOU race). Roll back and use
-        # the row that the other request committed.
         db.rollback()
-        cached = db.query(ParsedJDCache).filter(ParsedJDCache.jd_hash == digest).first()
-        if cached is None:
-            # Should never happen, but raise a clear error if it does
+        existing = _jd_cache_lookup(db, digest)
+        if existing is None:
             raise HTTPException(status_code=500, detail="JD cache write conflict; please retry.")
         logger.info(f"[CACHE RACE] Resolved concurrent insert for hash {digest[:12]}...")
-        from schema.schema import parsedJobDescription
-        parsed = parsedJobDescription(
-            job_title=cached.job_title or "",
-            skills=cached.skills or [],
-            job_description=cached.job_description,
-        )
-        return parsed, str(cached.id)
+        return existing
 
-    return parsed, str(record.id)
+
+# JD parses running right now, by hash. The extension pre-parses a JD when it is added and
+# then scores it straight away, so two requests often ask for the same parse at once; the
+# second waits for the first instead of paying for (and waiting on) a duplicate LLM call.
+_jd_parses_in_flight: dict = {}
+
+
+async def get_or_parse_jd(raw_jd: str, db: Session, llm=None):
+    """Return (parsedJobDescription, cache_id) for this JD, calling the LLM only on a cache miss.
+
+    `llm` is the per-request model (BYOK or server); the server's own model is used if None.
+    Database work runs on a worker thread so the event loop stays free for other requests.
+    """
+    digest = jd_hash(raw_jd)
+
+    cached = await run_in_threadpool(_jd_cache_lookup, db, digest)
+    if cached:
+        logger.info(f"[CACHE HIT] JD parse cache hit for hash {digest[:12]}...")
+        return cached
+
+    pending = _jd_parses_in_flight.get(digest)
+    if pending is not None:
+        result = await asyncio.shield(pending)
+        if result is not None:
+            logger.info(f"[CACHE WAIT] Reused an in-flight parse for hash {digest[:12]}...")
+            return result
+        # the other parse failed: fall through and try ourselves
+
+    if llm is None:
+        llm = build_server_llm()
+        if llm is None:
+            raise HTTPException(
+                status_code=500,
+                detail="No AI provider configured on server for first-time job description parsing."
+            )
+
+    future = asyncio.get_running_loop().create_future()
+    _jd_parses_in_flight.setdefault(digest, future)
+    try:
+        logger.info(f"[CACHE MISS] Parsing JD via LLM for hash {digest[:12]}...")
+        parsed = await parse_jd(job_description=raw_jd, llm=llm)
+        result = await run_in_threadpool(_jd_cache_store, db, digest, parsed)
+        if not future.done():
+            future.set_result(result)
+        return result
+    finally:
+        if not future.done():
+            future.set_result(None)  # waiters parse for themselves
+        if _jd_parses_in_flight.get(digest) is future:
+            del _jd_parses_in_flight[digest]
 
 
 def build_auth_response(user: User, access_token: str, db: Session) -> AuthResponse:
@@ -523,6 +564,7 @@ def build_auth_response(user: User, access_token: str, db: Session) -> AuthRespo
         weekly_limit=weekly_limit,
         daily_usage=daily_usage,
         monthly_usage=monthly_usage,
+        **onboarding_state(user),
     )
 
 
@@ -783,6 +825,7 @@ def get_current_user_profile(
         "daily_usage":        daily_usage,
         "monthly_usage":      monthly_usage,
         "created_at":         current_user.created_at.isoformat() if current_user.created_at else None,
+        **onboarding_state(current_user),
     }
 
 
@@ -891,6 +934,11 @@ async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db))
         # Never link (or create) an account from an email Google itself hasn't verified
         raise HTTPException(status_code=403, detail="Your Google email address isn't verified with Google.")
 
+    # ── Steps 2 and 3 are blocking database work: run them on a worker thread ──
+    return await run_in_threadpool(_google_sign_in, db, google_email, google_name, google_verified)
+
+
+def _google_sign_in(db: Session, google_email: str, google_name: Optional[str], google_verified: bool) -> AuthResponse:
     # ── Step 2: Find or create user ─────────────────────────────────────────
     user = db.query(User).filter(func.lower(User.email) == google_email).first()
 
@@ -1141,20 +1189,8 @@ async def upload_resume(
         if len(file_bytes) > FILE_MAX_BYTES:
             raise HTTPException(status_code=400, detail="File too large. Maximum 2 MB allowed.")
 
-        if is_docx:
-            # DOCX is a zip archive — magic bytes "PK"
-            if not file_bytes.startswith(b"PK"):
-                raise HTTPException(status_code=400, detail="Invalid file: not a DOCX document.")
-            resume_content = extract_docx_text(file_bytes)
-        else:
-            # PDFs always start with "%PDF"
-            if not file_bytes.startswith(b"%PDF"):
-                raise HTTPException(status_code=400, detail="Invalid file: not a PDF.")
-            reader = PdfReader(BytesIO(file_bytes))
-            # Guard against malformed / adversarial PDFs with absurd page counts
-            if len(reader.pages) > 50:
-                raise HTTPException(status_code=400, detail="PDF has too many pages (max 50).")
-            resume_content = "".join(page.extract_text() or "" for page in reader.pages)
+        # Text extraction is CPU work (seconds for a long PDF): keep it off the event loop
+        resume_content = await run_in_threadpool(extract_resume_text, file_bytes, is_docx)
     except HTTPException:
         raise
     except Exception as e:
@@ -1223,12 +1259,16 @@ async def upload_resume(
                 f.write(resume_yaml)
 
     # Store resume directly on the user record (replaces any previous resume)
-    try:
+    def save():
         current_user.resume_yaml        = resume_yaml
         current_user.resume_filename    = file.filename
         current_user.resume_uploaded_at = utcnow()
+        if current_user.onboarding_step == "resume":
+            current_user.onboarding_step = "projects"  # onboarding: the resume step is done
         db.commit()
-        db.refresh(current_user)
+
+    try:
+        await run_in_threadpool(save)
     except Exception as e:
         db.rollback()
         logger.error(f"DB write error after resume parse for {current_user.id}: {e}")
@@ -1243,7 +1283,7 @@ async def upload_resume(
 
 
 @app.get('/my-resume')
-async def get_my_resume(
+def get_my_resume(
     current_user: User = Depends(get_current_user)
 ):
     """Get the current user's active resume."""
@@ -1289,17 +1329,10 @@ async def calculate_ats_detailed(
     request_llm = resolve_request_llm(current_user, request.ai_config, db, enforce_quota=False)
 
     # Use cached parse if the client provided a jd_cache_id
+    parsed_jd = None
     if request.jd_cache_id:
-        cached = db.query(ParsedJDCache).filter(
-            ParsedJDCache.id == request.jd_cache_id
-        ).first()
-        if cached:
-            from schema.schema import parsedJobDescription
-            parsed_jd = parsedJobDescription(
-                job_title=cached.job_title or "",
-                skills=cached.skills or [],
-                job_description=cached.job_description,
-            )
+        parsed_jd = await run_in_threadpool(load_cached_jd, db, request.jd_cache_id)
+        if parsed_jd:
             logger.info(f"[CACHE HIT] Reused parsed JD for ATS (cache_id={request.jd_cache_id})")
         else:
             logger.warning(f"jd_cache_id {request.jd_cache_id} not found — falling back to live parse")
@@ -1352,13 +1385,13 @@ async def optimize_resume_endpoint(
 
         # Server AI: take a slot from the weekly quota atomically, up front. It is given back
         # if the generation fails, so a failed generation never counts.
-        slot = None if is_byok_in_use else reserve_generation_slot(current_user, db)
+        slot = None if is_byok_in_use else await run_in_threadpool(reserve_generation_slot, current_user, db)
         state = {"saved": False}
         try:
             return await _run_optimization(request, current_user, db, request_llm, slot, state)
         except BaseException:
             if slot and not state["saved"]:
-                release_generation_slot(current_user.id, slot[0], db)
+                await asyncio.shield(run_in_threadpool(release_generation_slot, current_user.id, slot[0], db))
             raise
 
 
@@ -1366,17 +1399,10 @@ async def _run_optimization(request, current_user: User, db: Session, request_ll
     """The optimization itself. `slot` is the reserved (week_start, count) for server AI, or None
     for BYOK. Sets state["saved"] once the result is committed."""
     # ---- Resolve parsed JD (cache-first) ----
+    parsed_jd = None
     if request.jd_cache_id:
-        cached = db.query(ParsedJDCache).filter(
-            ParsedJDCache.id == request.jd_cache_id
-        ).first()
-        if cached:
-            from schema.schema import parsedJobDescription
-            parsed_jd = parsedJobDescription(
-                job_title=cached.job_title or "",
-                skills=cached.skills or [],
-                job_description=cached.job_description,
-            )
+        parsed_jd = await run_in_threadpool(load_cached_jd, db, request.jd_cache_id)
+        if parsed_jd:
             logger.info(f"[CACHE HIT] Reused parsed JD for optimize (cache_id={request.jd_cache_id})")
         else:
             logger.warning(f"jd_cache_id {request.jd_cache_id} not found — falling back to live parse")
@@ -1397,6 +1423,14 @@ async def _run_optimization(request, current_user: User, db: Session, request_ll
 
         target_template = getattr(request, "template", None) or getattr(current_user, "selected_template", None) or "jakes_resume"
 
+        # The user's approved projects and achievements: context the optimizer may draw on
+        # when an item fits this job (it is free to use none of it)
+        try:
+            profile_pool = await run_in_threadpool(build_profile_addons, current_user.id, db)
+        except Exception as pool_err:
+            logger.warning(f"Profile pool unavailable for {current_user.id}; optimizing without it: {pool_err}")
+            profile_pool = ""
+
         # ---- Run Agentic Optimization & Validation Workflow ----
         workflow_result = await optimize_resume_agentic(
             resume_content=current_user.resume_yaml,
@@ -1404,7 +1438,7 @@ async def _run_optimization(request, current_user: User, db: Session, request_ll
             llm=request_llm,
             original_ats_score=original_score_value,
             template=target_template,
-            addons="",
+            addons=profile_pool,
         )
 
         optimized_yaml = workflow_result.get("final_yaml", "")
@@ -1467,15 +1501,18 @@ async def _run_optimization(request, current_user: User, db: Session, request_ll
         )
         # ---- Save the result. The quota slot was already taken atomically by the caller;
         # if this commit fails, the caller gives the slot back. ----
-        try:
-            db.add(record)
-            current_user.selected_template = target_template
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
+        def save():
+            try:
+                db.add(record)
+                current_user.selected_template = target_template
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+        await run_in_threadpool(save)
         state["saved"] = True
-        new_count = slot[1] if slot else get_weekly_usage(current_user.id, db)
+        new_count = slot[1] if slot else await run_in_threadpool(get_weekly_usage, current_user.id, db)
 
 
         weekly_limit = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
@@ -1486,8 +1523,8 @@ async def _run_optimization(request, current_user: User, db: Session, request_ll
 
         # ---- Usage stats for the meter (best-effort: the generation is already saved and counted) ----
         try:
-            daily_usage   = get_daily_usage(current_user.id, db)
-            monthly_usage = get_monthly_usage(current_user.id, db)
+            daily_usage   = await run_in_threadpool(get_daily_usage, current_user.id, db)
+            monthly_usage = await run_in_threadpool(get_monthly_usage, current_user.id, db)
         except Exception as meter_err:
             logger.warning(f"Usage meter lookup failed after a successful generation: {meter_err}")
             daily_usage = monthly_usage = 0
@@ -1566,7 +1603,7 @@ async def explain_changes_endpoint(
 # ==================== HISTORY ENDPOINT ====================
 
 @app.get('/my-optimizations')
-async def get_my_optimizations(
+def get_my_optimizations(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1597,7 +1634,7 @@ async def get_my_optimizations(
     ]
 
 @app.get('/my-optimizations/{record_id}/pdf')
-async def download_optimization_pdf(
+def download_optimization_pdf(
     record_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1639,7 +1676,7 @@ async def download_optimization_pdf(
 # ==================== PDF GENERATION ENDPOINT ====================
 
 @app.post('/generate-pdf')
-async def generate_pdf_endpoint(
+def generate_pdf_endpoint(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     body: GeneratePDFRequest = None,

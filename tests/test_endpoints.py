@@ -413,3 +413,53 @@ class TestDownloadFilenames(Base):
         self.assertEqual(f("skills: [x]", make_user(full_name="Udit Bhatia")), "Udit_Bhatia_resume.pdf")
         self.assertEqual(f("skills: [x]", make_user(full_name=None), "tex"), "resume.tex")
         self.assertIn('filename="Maria_Jose_resume.pdf"', main.attachment_header("María_José_resume.pdf"))
+
+
+class TestJdParseDeduplication(unittest.TestCase):
+    """The extension pre-parses a JD and scores it straight away: one LLM parse, not two."""
+
+    def test_concurrent_parses_of_the_same_jd_share_one_llm_call(self):
+        import asyncio
+        parsed = parsedJobDescription(job_title="Eng", skills=["Python"], job_description="d")
+        calls = []
+
+        async def slow_parse(job_description, llm):
+            calls.append(job_description)
+            await asyncio.sleep(0.2)
+            return parsed
+
+        async def both():
+            return await asyncio.gather(main.get_or_parse_jd(JD, MagicMock(), llm=object()),
+                                        main.get_or_parse_jd(JD, MagicMock(), llm=object()))
+
+        with patch.object(main, "_jd_cache_lookup", return_value=None), \
+             patch.object(main, "_jd_cache_store", side_effect=lambda db, digest, p: (p, "cache-1")), \
+             patch.object(main, "parse_jd", slow_parse):
+            first, second = asyncio.run(both())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first, second)
+        self.assertEqual(main._jd_parses_in_flight, {})
+
+    def test_waiter_parses_itself_if_the_first_parse_fails(self):
+        import asyncio
+        parsed = parsedJobDescription(job_title="Eng", skills=[], job_description="d")
+        attempts = []
+
+        async def flaky_parse(job_description, llm):
+            attempts.append(1)
+            await asyncio.sleep(0.1)
+            if len(attempts) == 1:
+                raise RuntimeError("provider hiccup")
+            return parsed
+
+        async def both():
+            return await asyncio.gather(main.get_or_parse_jd(JD, MagicMock(), llm=object()),
+                                        main.get_or_parse_jd(JD, MagicMock(), llm=object()),
+                                        return_exceptions=True)
+
+        with patch.object(main, "_jd_cache_lookup", return_value=None), \
+             patch.object(main, "_jd_cache_store", side_effect=lambda db, digest, p: (p, "cache-1")), \
+             patch.object(main, "parse_jd", flaky_parse):
+            first, second = asyncio.run(both())
+        self.assertIsInstance(first, RuntimeError)
+        self.assertEqual(second, (parsed, "cache-1"))

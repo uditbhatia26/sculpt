@@ -70,11 +70,15 @@ def decode_token(token: str) -> dict:
         )
 
 
-async def get_current_user(
+def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
-    """Get the current authenticated user from token"""
+    """Get the current authenticated user from token.
+
+    A plain `def` on purpose: the user lookup is a blocking database query, and FastAPI
+    runs sync dependencies on a worker thread. As `async def` it ran on the event loop and
+    held up every other request (refresh, profile, history) while it waited on the DB."""
     token = credentials.credentials
     
     try:

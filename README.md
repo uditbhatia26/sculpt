@@ -108,6 +108,17 @@ Two scoring modes are available.
 
 ---
 
+## Profile pool, onboarding and Chisel
+
+People sign up and set up on the website; the extension picks the session up from there.
+
+- **Onboarding** (`profile_routes.py`): resume, then projects, then achievements. `users.onboarding_step` only moves forward, so leaving and returning lands on the furthest step reached. `setup_required` (in `/auth/me` and every auth response) is what locks the extension; accounts that existed before onboarding are grandfathered and never locked.
+- **Profile pool**: `profile_projects` and `profile_achievements`. `build_profile_addons()` turns the approved items into the optimizer's ADDONS block. The optimizer uses an item only when it fits the job, and may use none.
+- **Chisel** (`POST /chisel/projects`): reads a GitHub repository the user contributed to (`config/github_client.py` picks the README, file tree, manifests and key source files) and writes three bullets (`models/profile_chains.py`). It never invents numbers. Limits per plan (`CHISEL_LIMITS`): free saves 1 Chisel project and gets 1 add per period; Pro saves 5 and gets 5 adds. A period starts with the first add and lasts 30 days (`users.chisel_period_start`, `chisel_period_adds`). Any project can be removed at any time; that frees its slot but does not give the add back. Three AI edits per Chisel project (`/revise`); edits the user types are unlimited. A failed generation or edit is not counted.
+- **Hand-added projects** (`POST /profile/projects`): written by the user, no AI edits. Free: one at a time (replace it whenever). Pro: no visible limit, with a quiet safety cap of 20 (`MANUAL_PROJECT_SAFETY_CAP`).
+- **GitHub connection**: `/auth/github/start` returns the authorize URL with a signed, 10-minute state; `/auth/github/callback` links the account and redirects to `DASHBOARD_URL/?github=<result>`. Public repositories by default; `?private=true` asks for the `repo` scope. The token is stored encrypted (Fernet, key derived from `JWT_SECRET_KEY`), and a GitHub account can back only one Sculpt account. Ownership rule: the user must appear in the repository's contributors, or own it and it is not a fork.
+- **Polish** (`POST /profile/refine`): tidies an achievement's wording without adding facts; nothing is saved until the user accepts.
+
 ## Setup and tests
 
 ```bash
@@ -116,10 +127,10 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-Optional env vars: `OPTIMIZE_MAX_RETRIES` (0-4, default 2; each retry costs one draft + one ATS LLM call), `ADMIN_CLEANUP_TOKEN` (sent as an `X-Cleanup-Token` header to `DELETE /admin/cleanup`), `CORS_ORIGINS` (comma-separated dashboard origins; localhost and `chrome-extension://` are always allowed), `DEBUG_DUMP=true`. `GOOGLE_CLIENT_IDS` (comma-separated OAuth client IDs allowed to sign in with Google: the extension's client and the dashboard's web client; defaults to the extension's).
+Optional env vars: `OPTIMIZE_MAX_RETRIES` (0-4, default 2; each retry costs one draft + one ATS LLM call), `ADMIN_CLEANUP_TOKEN` (sent as an `X-Cleanup-Token` header to `DELETE /admin/cleanup`), `CORS_ORIGINS` (comma-separated dashboard origins; localhost and `chrome-extension://` are always allowed), `DEBUG_DUMP=true`, `DASHBOARD_URL` (the website's address, default `http://localhost:5173`), `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` (GitHub OAuth app, needed for Chisel). `GOOGLE_CLIENT_IDS` (comma-separated OAuth client IDs allowed to sign in with Google: the extension's client and the dashboard's web client; defaults to the extension's).
 
 ```bash
-python -m unittest tests.test_hardening tests.test_endpoints test_pillar1_byok   # DB-free
+python -m pytest tests test_pillar1_byok.py                # DB-free (hardening, endpoints, profile and Chisel)
 python test_workflow.py                                     # needs Tectonic in bin/
 python test_latex_compilation.py                            # needs Tectonic in bin/
 

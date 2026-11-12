@@ -77,6 +77,9 @@ class AuthResponse(BaseModel):
     weekly_limit:     int           = Field(description="Max generations allowed per week for their plan")
     daily_usage:      int           = Field(default=0, description="Generations made today")
     monthly_usage:    int           = Field(default=0, description="Generations made this calendar month")
+    onboarding_step:     str        = Field(default="resume", description="resume | projects | achievements | done")
+    onboarding_complete: bool       = Field(default=False, description="Whether website onboarding is finished")
+    setup_required:      bool       = Field(default=False, description="True when the extension must wait for onboarding")
 
 
 
