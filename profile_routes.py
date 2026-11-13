@@ -130,13 +130,16 @@ def count_chisel_add(user: User) -> None:
     user.chisel_generations_used = (user.chisel_generations_used or 0) + 1
 
 
-def chisel_status(user: User, db: Session) -> dict:
-    """Whether the user can add another Chisel project right now, and if not, why."""
+def chisel_status(user: User, db: Session, saved: int | None = None) -> dict:
+    """Whether the user can add another Chisel project right now, and if not, why.
+    Pass `saved` (the user's GitHub project count) when the caller already has the projects,
+    to skip a database round trip."""
     plan = _plan(user)
     limits = CHISEL_LIMITS[plan]
-    saved = db.query(ProfileProject).filter(
-        ProfileProject.user_id == user.id, ProfileProject.source == "github"
-    ).count()
+    if saved is None:
+        saved = db.query(ProfileProject).filter(
+            ProfileProject.user_id == user.id, ProfileProject.source == "github"
+        ).count()
     used, ends = chisel_period(user)
     adds_left = max(0, limits["adds"] - used)
     when = f"{ends.day} {ends.strftime('%b %Y')}" if ends else ""   # "9 Dec 2026", as the website writes it
@@ -165,12 +168,14 @@ def chisel_status(user: User, db: Session) -> dict:
     }
 
 
-def manual_status(user: User, db: Session) -> dict:
-    """Hand-added projects: the visible limit (None on Pro) and whether one more fits."""
+def manual_status(user: User, db: Session, saved: int | None = None) -> dict:
+    """Hand-added projects: the visible limit (None on Pro) and whether one more fits.
+    Pass `saved` (the user's hand-added count) when the caller already has the projects."""
     limit = MANUAL_PROJECT_LIMITS[_plan(user)]
-    saved = db.query(ProfileProject).filter(
-        ProfileProject.user_id == user.id, ProfileProject.source == "manual"
-    ).count()
+    if saved is None:
+        saved = db.query(ProfileProject).filter(
+            ProfileProject.user_id == user.id, ProfileProject.source == "manual"
+        ).count()
     cap = limit if limit is not None else MANUAL_PROJECT_SAFETY_CAP
     return {"limit": limit, "used": saved, "can_add": saved < cap}
 
@@ -262,7 +267,9 @@ _chisel_in_flight: set = set()
 
 @router.get("/profile")
 def get_profile(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Everything the onboarding flow and the dashboard's Profile section show."""
+    """Everything the onboarding flow and the dashboard's Profile section show.
+    Three queries in all (the user, their projects, their achievements): the allowance counts
+    come from the projects already loaded, since every round trip to the database counts."""
     projects = db.query(ProfileProject).filter(
         ProfileProject.user_id == current_user.id).order_by(ProfileProject.created_at).all()
     achievements = db.query(ProfileAchievement).filter(
@@ -281,8 +288,8 @@ def get_profile(current_user: User = Depends(get_current_user), db: Session = De
             "username": current_user.github_username,
             "private_access": bool(current_user.github_private_access),
         },
-        "chisel": chisel_status(current_user, db),
-        "manual": manual_status(current_user, db),
+        "chisel": chisel_status(current_user, db, saved=sum(p.source == "github" for p in projects)),
+        "manual": manual_status(current_user, db, saved=sum(p.source == "manual" for p in projects)),
         "projects": [project_out(p) for p in projects],
         "achievements": [achievement_out(a) for a in achievements],
         "limits": {

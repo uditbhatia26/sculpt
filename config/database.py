@@ -1,8 +1,9 @@
-from sqlalchemy import create_engine, pool
+from sqlalchemy import create_engine, event, exc, pool
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from pathlib import Path
 import os
+import time
 from dotenv import load_dotenv
 import logging
 
@@ -31,14 +32,42 @@ engine = create_engine(
     poolclass=pool.QueuePool,
     pool_size=5,           # Keep 5 persistent connections
     max_overflow=10,       # Allow up to 10 extra connections under load
-    pool_pre_ping=True,    # Drop and recreate stale connections (Neon idles after 5 min)
-    pool_recycle=300,      # Recycle connections every 5 minutes
+    # No ping on every checkout: each one is a full round trip to the database, which is a
+    # big share of a request when the database is far away. Connections that have sat idle
+    # are pinged instead (below), and none is kept past 4 minutes, inside Neon's 5-minute
+    # idle window.
+    pool_pre_ping=False,
+    pool_recycle=240,
     echo=False,
 )
 
 # expire_on_commit=False: after a commit, keep the loaded values instead of expiring them.
 # Expired objects reload on the next attribute read, which in an async endpoint is a hidden
 # blocking query (about 300 ms to Neon) on the event loop.
+# Ping a pooled connection only if it has been idle for a while: a recently used one is
+# known to be alive. A failed ping raises DisconnectionError, which makes the pool discard
+# that connection and hand out a fresh one, so a dropped connection never reaches a request.
+IDLE_PING_AFTER = 60  # seconds
+
+
+@event.listens_for(engine, "checkout")
+def _ping_if_idle(dbapi_connection, connection_record, connection_proxy):
+    last_used = connection_record.info.get("last_used")
+    if last_used is None or time.monotonic() - last_used < IDLE_PING_AFTER:
+        return
+    try:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("SELECT 1")
+        cursor.close()
+    except Exception as e:
+        raise exc.DisconnectionError() from e
+
+
+@event.listens_for(engine, "checkin")
+def _mark_used(dbapi_connection, connection_record):
+    connection_record.info["last_used"] = time.monotonic()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
 Base = declarative_base()
 
