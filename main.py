@@ -29,6 +29,7 @@ from config.latex_generator import (
     render_latex_template,
     generate_pdf_from_resume,
 )
+from config.latex_sanitizer import project_key, split_project_heading
 from config.email import send_verification_email, send_password_reset_email
 from config.rate_limit import rate_limit
 from config.ai_allowance import ai_allowance
@@ -454,35 +455,54 @@ def compute_resume_diff(original_yaml: str, optimized_yaml: str) -> list:
             if removed:
                 changes.append({"severity": "critical", "label": f"{len(removed)} skill(s) removed", "items": removed})
 
+        def bullets_of(entry: dict) -> list:
+            raw = entry.get("achievements") or entry.get("highlights") or entry.get("bullets") or []
+            return [str(b).strip() for b in raw if str(b).strip()] if isinstance(raw, list) else []
+
+        def keyed(entries, name_field, key_fn) -> dict:
+            """{comparison key: (display name, entry)}, so cosmetic edits to a name
+            (case, spacing, a stack appended after " | ") still match the same entry."""
+            out = {}
+            for e in entries or []:
+                if isinstance(e, dict):
+                    shown = split_project_heading(e.get(name_field))[0] if name_field == "name" else str(e.get(name_field) or "").strip()
+                    out.setdefault(key_fn(e.get(name_field)), (shown, e))
+            return out
+
+        company_key = lambda c: re.sub(r"[^a-z0-9]+", "", str(c or "").lower())
+
         # 3. Experience bullets
-        orig_exp = {e.get("company", ""): e for e in (orig.get("experience") or []) if isinstance(e, dict)}
-        opti_exp = {e.get("company", ""): e for e in (opti.get("experience") or []) if isinstance(e, dict)}
-        for company, orig_entry in orig_exp.items():
-            if company not in opti_exp:
+        orig_exp = keyed(orig.get("experience"), "company", company_key)
+        opti_exp = keyed(opti.get("experience"), "company", company_key)
+        for key, (company, orig_entry) in orig_exp.items():
+            if key not in opti_exp:
                 changes.append({"severity": "critical", "label": f"Experience entry removed: {company}", "items": None})
                 continue
-            opti_entry   = opti_exp[company]
-            orig_bullets = set(orig_entry.get("achievements") or [])
-            opti_bullets = set(opti_entry.get("achievements") or [])
-            # Each changed bullet appears twice in the symmetric difference
-            # (once as the removed original, once as the added enhanced version),
-            # so divide by 2 to get the real count of enhanced bullets.
-            changed = len(orig_bullets.symmetric_difference(opti_bullets)) // 2
+            orig_bullets = set(bullets_of(orig_entry))
+            opti_bullets = set(bullets_of(opti_exp[key][1]))
+            # A rewritten bullet shows up on both sides of the symmetric difference (old and
+            # new text); count the larger side so additions and removals count once each.
+            changed = max(len(orig_bullets - opti_bullets), len(opti_bullets - orig_bullets))
             if changed:
                 changes.append({"severity": "positive", "label": f"{changed} bullet(s) enhanced at {company}", "items": None})
-        for company in opti_exp:
-            if company not in orig_exp:
+        for key, (company, _) in opti_exp.items():
+            if key not in orig_exp:
                 changes.append({"severity": "info", "label": f"New experience entry added: {company}", "items": None})
 
-        # 4. Projects
-        orig_proj_names = {p.get("name", "") for p in (orig.get("projects") or []) if isinstance(p, dict)}
-        opti_proj_names = {p.get("name", "") for p in (opti.get("projects") or []) if isinstance(p, dict)}
-        added_projs   = sorted(opti_proj_names - orig_proj_names)
-        removed_projs = sorted(orig_proj_names - opti_proj_names)
+        # 4. Projects, matched by their own name: the optimizer may restyle a heading
+        # ("LetsCelebrate" -> "LetsCelebrate | React, Node.js") without adding or removing anything
+        orig_proj = keyed(orig.get("projects"), "name", project_key)
+        opti_proj = keyed(opti.get("projects"), "name", project_key)
+        added_projs   = sorted(opti_proj[k][0] for k in opti_proj.keys() - orig_proj.keys())
+        removed_projs = sorted(orig_proj[k][0] for k in orig_proj.keys() - opti_proj.keys())
+        rewritten     = sorted(orig_proj[k][0] for k in orig_proj.keys() & opti_proj.keys()
+                               if bullets_of(orig_proj[k][1]) != bullets_of(opti_proj[k][1]))
         if added_projs:
             changes.append({"severity": "positive", "label": f"{len(added_projs)} project(s) added", "items": added_projs})
         if removed_projs:
             changes.append({"severity": "critical", "label": f"{len(removed_projs)} project(s) removed", "items": removed_projs})
+        if rewritten:
+            changes.append({"severity": "positive", "label": f"Bullets rewritten in {len(rewritten)} project(s)", "items": rewritten})
 
         # 5. Summary
         if orig.get("summary") != opti.get("summary"):

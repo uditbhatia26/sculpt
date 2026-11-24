@@ -48,6 +48,31 @@ def latex_escape(value: Any) -> str:
     return _LATEX_ESCAPE_REGEX.sub(lambda match: _LATEX_ESCAPES[match.group(0)], text)
 
 
+_HEADING_SPLIT = re.compile(r"\s*\|\s*")
+
+
+def split_project_heading(name: Any) -> tuple:
+    """("LetsCelebrate | React, Node.js") -> ("LetsCelebrate", ["React", "Node.js"]).
+
+    The optimizer sometimes writes a project's tech stack into its name, Jake's-Resume
+    style. The templates already print the stack after the name, so the name must hold
+    only the project's own name. A name without " | " comes back unchanged with no stack.
+    """
+    text = str(name or "").strip()
+    parts = _HEADING_SPLIT.split(text, maxsplit=1)
+    if len(parts) < 2 or not parts[0]:
+        return text, []
+    stack = [s.strip() for s in parts[1].split(",") if s.strip()]
+    return parts[0], stack
+
+
+def project_key(name: Any) -> str:
+    """A comparison key for a project: its own name, lowercased, letters and digits only.
+    "LetsCelebrate | React" and "letscelebrate" give the same key."""
+    own_name, _ = split_project_heading(name)
+    return re.sub(r"[^a-z0-9]+", "", own_name.lower())
+
+
 def normalize_resume_data(raw_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Normalize and sanitize raw resume data (from YAML or JSON) into a predictable structure.
 
@@ -146,8 +171,14 @@ def normalize_resume_data(raw_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             github_link = str(links.get("github") or "").strip()
             live_link = str(links.get("live") or links.get("demo") or "").strip()
 
+        # A stack written into the name ("Name | React, Node.js") would print twice in the
+        # heading: keep the name alone and fold any technologies it named into the stack
+        project_name, named_stack = split_project_heading(proj.get("name"))
+        known = {s.lower() for s in stack_list}
+        stack_list += [s for s in named_stack if s.lower() not in known]
+
         projects_list.append({
-            "name": str(proj.get("name") or "").strip(),
+            "name": project_name,
             "description": str(proj.get("description") or "").strip(),
             "role": str(proj.get("role") or "").strip(),
             "period": str(proj.get("period") or "").strip(),

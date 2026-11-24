@@ -442,7 +442,7 @@ TEMPLATE_GUIDANCE = {
     "jakes_resume": (
         "LAYOUT & TONE CONSTRAINT (Standard Tech / Jake's Resume):\n"
         "- Focus: Maximum technical ATS impact using the Google XYZ / STAR format (Accomplished [X] as measured by [Y], by doing [Z]).\n"
-        "- Technologies: Prominently feature tech stack in project headings and naturally weave core technical keywords into experience bullets.\n"
+        "- Technologies: List each project's technologies in its `stack` field (the template prints them in the project heading). Keep `name` to the project's own name, exactly as given; never append the stack or anything else to it. Naturally weave core technical keywords into experience bullets.\n"
         "- Skills: High density, logical categorization of programming languages, frameworks, cloud, and tools."
     ),
 }
