@@ -1,59 +1,114 @@
 """
-Email utility for ResumeSculpt.
+Email for ResumeSculpt: the sign-up verification link and the password-reset link.
 
-Uses Python's built-in smtplib with Gmail SMTP (TLS on port 587).
-Required env vars:
-    MAIL_FROM          — your Gmail address (e.g. hello@gmail.com)
-    MAIL_PASSWORD      — Gmail App Password (16 chars, no spaces)
-    MAIL_FROM_NAME     — display name (default: ResumeSculpt)
-    APP_BASE_URL       — base URL of the backend (e.g. https://api.resumesculpt.com)
+Two ways to send, picked by what is configured:
+
+1. Resend, an email API over HTTPS (production). Used when RESEND_API_KEY is set. Works on
+   hosts that block outgoing SMTP (Render's free instances do), and sends from your own
+   domain once it is verified in Resend.
+       RESEND_API_KEY   re_... (Resend dashboard > API Keys, "Sending access")
+       MAIL_FROM        an address on the verified domain, e.g. no-reply@resumesculpt.app
+2. SMTP (local development, or any host that allows it). Gmail by default.
+       MAIL_FROM        the SMTP login address, e.g. you@gmail.com
+       MAIL_PASSWORD    its password; for Gmail an App Password (16 letters, no spaces)
+       SMTP_HOST, SMTP_PORT   default smtp.gmail.com and 587 (STARTTLS)
+
+Both use:
+    MAIL_FROM_NAME   display name (default: Sculpt)
+    MAIL_REPLY_TO    optional: where replies go (useful when MAIL_FROM is a no-reply address)
+    APP_BASE_URL     the backend's address; the links in the emails point at it
 """
+import html as html_lib  # not "html": the email builders use that name for the body
 import smtplib
 import logging
 import os
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import httpx
+
 logger = logging.getLogger("Sculpt")
 
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
+RESEND_URL = "https://api.resend.com/emails"
 
 
-def _send(to_email: str, subject: str, html_body: str) -> bool:
-    """Low-level: open SMTP connection and send a single email. Returns True on success."""
-    mail_from     = os.getenv("MAIL_FROM", "")
-    mail_password = os.getenv("MAIL_PASSWORD", "")
-    from_name     = os.getenv("MAIL_FROM_NAME", "ResumeSculpt")
+def _mask(email: str) -> str:
+    """u***@example.com, so addresses don't end up in the logs."""
+    local, _, domain = (email or "").partition("@")
+    return f"{local[:1]}***@{domain}" if domain else "***"
 
-    if not mail_from or not mail_password:
-        logger.warning("[EMAIL] MAIL_FROM or MAIL_PASSWORD not set — email not sent.")
+
+def _send_resend(api_key: str, sender: str, to_email: str, subject: str, html_body: str, reply_to: str) -> bool:
+    payload = {"from": sender, "to": [to_email], "subject": subject, "html": html_body}
+    if reply_to:
+        payload["reply_to"] = reply_to
+    try:
+        res = httpx.post(RESEND_URL, json=payload, timeout=15,
+                         headers={"Authorization": f"Bearer {api_key}"})
+    except httpx.HTTPError as e:
+        logger.error(f"[EMAIL] Resend unreachable sending to {_mask(to_email)}: {e}")
         return False
+    if res.status_code >= 300:
+        # Resend explains the problem in "message" (e.g. the domain isn't verified yet)
+        try:
+            reason = res.json().get("message") or res.text
+        except ValueError:
+            reason = res.text
+        logger.error(f"[EMAIL] Resend refused '{subject}' to {_mask(to_email)}: {res.status_code} {reason[:300]}")
+        return False
+    logger.info(f"[EMAIL] Sent '{subject}' to {_mask(to_email)} via Resend")
+    return True
+
+
+def _send_smtp(mail_from: str, from_name: str, to_email: str, subject: str, html_body: str, reply_to: str) -> bool:
+    mail_password = os.getenv("MAIL_PASSWORD", "")
+    if not mail_password:
+        logger.warning("[EMAIL] Neither RESEND_API_KEY nor MAIL_PASSWORD is set: email not sent.")
+        return False
+    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    port = int(os.getenv("SMTP_PORT", "587"))
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = f"{from_name} <{mail_from}>"
     msg["To"]      = to_email
+    if reply_to:
+        msg["Reply-To"] = reply_to
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+        with smtplib.SMTP(host, port, timeout=10) as server:
             server.ehlo()
             server.starttls()
             server.login(mail_from, mail_password)
             server.sendmail(mail_from, [to_email], msg.as_string())
-        logger.info(f"[EMAIL] Sent '{subject}' → {to_email}")
+        logger.info(f"[EMAIL] Sent '{subject}' to {_mask(to_email)} via SMTP")
         return True
     except Exception as e:
-        logger.error(f"[EMAIL] Failed to send to {to_email}: {e}")
+        logger.error(f"[EMAIL] Failed to send to {_mask(to_email)} via SMTP: {e}")
         return False
+
+
+def _send(to_email: str, subject: str, html_body: str) -> bool:
+    """Send one email. Returns True on success; never raises."""
+    mail_from = os.getenv("MAIL_FROM", "").strip()
+    from_name = os.getenv("MAIL_FROM_NAME", "Sculpt").strip() or "Sculpt"
+    reply_to  = os.getenv("MAIL_REPLY_TO", "").strip()
+    if not mail_from:
+        logger.warning("[EMAIL] MAIL_FROM not set: email not sent.")
+        return False
+
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if api_key:
+        return _send_resend(api_key, f"{from_name} <{mail_from}>", to_email, subject, html_body, reply_to)
+    return _send_smtp(mail_from, from_name, to_email, subject, html_body, reply_to)
 
 
 def send_verification_email(to_email: str, full_name: str | None, token: str) -> bool:
     """Send the email-verification link to a newly signed-up user."""
     base_url    = os.getenv("APP_BASE_URL", "http://localhost:8000")
     verify_url  = f"{base_url}/auth/verify-email?token={token}"
-    name_label  = full_name or "there"
+    name_label  = html_lib.escape(full_name or "there")  # a name is user input: never raw HTML
 
     html = f"""
     <!DOCTYPE html>
@@ -133,7 +188,7 @@ def send_password_reset_email(to_email: str, full_name: str | None, token: str) 
     """Send a password-reset link (valid 30 minutes)."""
     base_url   = os.getenv("APP_BASE_URL", "http://localhost:8000")
     reset_url  = f"{base_url}/auth/reset-password?token={token}"
-    name_label = full_name or "there"
+    name_label = html_lib.escape(full_name or "there")  # a name is user input: never raw HTML
     html = f"""
     <!DOCTYPE html>
     <html><head><meta charset="utf-8"></head>

@@ -1155,11 +1155,14 @@ def resend_verification(
     current_user.email_verification_sent_at = utcnow()
     db.commit()
 
+    # send_verification_email reports failure by returning False (it never raises)
     try:
-        send_verification_email(current_user.email, current_user.full_name, token)
+        sent = send_verification_email(current_user.email, current_user.full_name, token)
     except Exception as e:
-        logger.error(f"[EMAIL] Resend failed for {current_user.email}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to send verification email. Please try again.")
+        logger.error(f"[EMAIL] Resend failed for user {current_user.id}: {e}")
+        sent = False
+    if not sent:
+        raise HTTPException(status_code=502, detail="We couldn't send the verification email just now. Please try again in a few minutes.")
 
     return {"message": "Verification email sent. Please check your inbox."}
 
