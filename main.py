@@ -31,6 +31,7 @@ from config.latex_generator import (
 )
 from config.latex_sanitizer import project_key, split_project_heading
 from config.email import send_verification_email, send_password_reset_email
+from config import branding
 from config.rate_limit import rate_limit
 from config.ai_allowance import ai_allowance
 from io import BytesIO
@@ -670,6 +671,25 @@ def health():
     return {"status": "OK", "model_loaded": has_server_key}
 
 
+@app.get("/client-ip", dependencies=[Depends(rate_limit("client_ip", 30, 60))])
+def client_ip_check(request: Request):
+    """Which address the rate limiter sees for the caller, and the headers it came from.
+    Shows callers only their own request; used to set CLIENT_IP_HEADER / TRUSTED_PROXY_HOPS."""
+    from config.rate_limit import client_ip
+    h = request.headers
+    return {
+        "rate_limited_as": client_ip(request),
+        "connection_from": request.client.host if request.client else None,
+        "x_forwarded_for": h.get("x-forwarded-for"),
+        "x_real_ip": h.get("x-real-ip"),
+        "true_client_ip": h.get("true-client-ip"),
+        "cf_connecting_ip": h.get("cf-connecting-ip"),
+        "forwarded": h.get("forwarded"),
+        "settings": {"CLIENT_IP_HEADER": os.getenv("CLIENT_IP_HEADER") or None,
+                     "TRUSTED_PROXY_HOPS": os.getenv("TRUSTED_PROXY_HOPS") or None},
+    }
+
+
 
 # ==================== UNIFIED LLM RESOLVER (PILLAR 1) ====================
 
@@ -1078,57 +1098,44 @@ def _google_sign_in(db: Session, google_email: str, google_name: Optional[str], 
 
 
 @app.get('/auth/verify-email')
-def verify_email(token: str, db: Session = Depends(get_db)):
+def verify_email(token: str = "", db: Session = Depends(get_db)):
     """
-    Verify a user's email address using the one-time token sent on signup.
-    Token is valid for 24 hours.
+    Verify a user's email address using the one-time token sent on signup (valid 24 hours).
+    Opened from the email in a browser, so every outcome is a page, never JSON.
     """
-    if not token:
-        raise HTTPException(status_code=400, detail="Verification token is required.")
+    def page(status: int, **kw):
+        return HTMLResponse(branding.message_page(**kw), status_code=status,
+                            headers={"Content-Security-Policy": branding.page_csp()})
 
-    user = db.query(User).filter(User.email_verification_token == token).first()
+    def invalid():
+        return page(400, icon=branding.ICON_ALERT, warn=True, kicker="Link not valid",
+                    heading="This link doesn't work",
+                    text="It may have been used already, or only part of it was copied. Sign in to Sculpt "
+                         "and ask for a new verification email from the banner at the top.")
+
+    user = db.query(User).filter(User.email_verification_token == token).first() if token else None
     if not user:
-        raise HTTPException(status_code=400, detail="Invalid or expired verification link.")
+        return invalid()
 
-    # Check 24-hour expiry
     if user.email_verification_sent_at:
         age = utcnow() - user.email_verification_sent_at.replace(tzinfo=None)
         if age.total_seconds() > 86_400:  # 24 hours
-            raise HTTPException(
-                status_code=400,
-                detail="Verification link has expired. Please request a new one."
-            )
+            return page(400, icon=branding.ICON_ALERT, warn=True, kicker="Link expired",
+                        heading="This link has expired",
+                        text="Verification links last 24 hours. Sign in to Sculpt and ask for a new one "
+                             "from the banner at the top.")
 
-    if user.email_verified:
-        return {"message": "Email already verified. You can close this page."}
+    if not user.email_verified:
+        user.email_verified = True
+        user.email_verification_token = None  # one use only
+        db.commit()
+        logger.info(f"[OK] Email verified for user {user.id}")
 
-    user.email_verified             = True
-    user.email_verification_token   = None  # Invalidate token after use
-    db.commit()
-
-    logger.info(f"[OK] Email verified for {user.email}")
-    # Return a simple success page the browser can display
-    from fastapi.responses import HTMLResponse
-    return HTMLResponse("""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="utf-8"><title>Email Verified — ResumeSculpt</title></head>
-    <body style="font-family:'Segoe UI',Arial,sans-serif;background:#0f1117;
-                 display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-      <div style="background:#1a1d2e;border-radius:16px;padding:48px;text-align:center;max-width:420px;">
-        <div style="font-size:56px;">✅</div>
-        <h1 style="color:#e2e8f0;margin:16px 0 8px;">Email Verified!</h1>
-        <p style="color:#94a3b8;margin:0 0 32px;line-height:1.6;">
-          Your account is now fully active.<br>You can close this tab and return to the extension.
-        </p>
-        <a href="#" onclick="window.close()"
-           style="background:linear-gradient(135deg,#6c63ff,#a78bfa);
-                  color:#fff;padding:12px 28px;border-radius:8px;
-                  text-decoration:none;font-weight:600;">Close Tab</a>
-      </div>
-    </body>
-    </html>
-    """, status_code=200)
+    return page(200, icon=branding.ICON_CHECK, kicker="Email verified",
+                heading="You're all set",
+                text="Your email is confirmed and your Sculpt account is fully active. Head back to Sculpt "
+                     "to upload your resume and start tailoring it.",
+                note="Using the Chrome extension? It picks up your account as soon as you're signed in on the website.")
 
 
 @app.post('/auth/resend-verification')
@@ -1171,28 +1178,44 @@ def resend_verification(
 
 PASSWORD_RESET_TTL_MINUTES = 30
 
-RESET_PAGE_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reset password - ResumeSculpt</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="font-family:'Segoe UI',Arial,sans-serif;background:#0f1117;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;">
-<form id="f" style="background:#1a1d2e;border-radius:16px;padding:40px;width:340px;color:#e2e8f0;">
-<h1 style="margin:0 0 16px;font-size:22px;">Reset your password</h1>
-<input id="p" type="password" minlength="6" maxlength="128" required placeholder="New password"
- style="width:100%;box-sizing:border-box;padding:12px;border-radius:8px;border:1px solid #2d3148;background:#0f1117;color:#e2e8f0;margin-bottom:12px;">
-<button style="width:100%;padding:12px;border:0;border-radius:8px;background:linear-gradient(135deg,#6c63ff,#a78bfa);color:#fff;font-weight:600;cursor:pointer;">Set new password</button>
-<p id="m" style="color:#94a3b8;font-size:14px;min-height:20px;"></p>
+RESET_FORM = f"""
+<div class="badge">{branding.ICON_KEY}</div>
+<p class="kicker">Password reset</p>
+<h1>Choose a new password</h1>
+<p>Use at least 6 characters. You'll sign in with it on the website and the extension.</p>
+<form id="reset" data-token="__TOKEN__" novalidate>
+  <label for="p1">New password</label>
+  <input id="p1" type="password" autocomplete="new-password" minlength="6" maxlength="128" required>
+  <label for="p2">Confirm new password</label>
+  <input id="p2" type="password" autocomplete="new-password" minlength="6" maxlength="128" required>
+  <button class="btn" id="go" type="submit">Set new password &rarr;</button>
+  <p class="msg" id="msg" role="status" aria-live="polite"></p>
 </form>
-<script>
-document.getElementById('f').addEventListener('submit', async function(e){
+<div id="done" hidden>
+  <p class="msg">Your password has been changed.</p>
+  <a class="btn" href="{branding.esc(branding.site_url())}">Sign in to Sculpt &rarr;</a>
+</div>
+"""
+
+# Reads the token from the form's data attribute (never pasted into script text)
+RESET_SCRIPT = """
+var f=document.getElementById('reset'),m=document.getElementById('msg'),go=document.getElementById('go');
+function say(t,err){m.textContent=t;m.className=err?'msg msg--err':'msg';}
+f.addEventListener('submit',async function(e){
   e.preventDefault();
-  var m=document.getElementById('m'); m.textContent='Saving...';
+  var a=document.getElementById('p1').value,b=document.getElementById('p2').value;
+  if(a.length<6){say('Use at least 6 characters.',true);return;}
+  if(a!==b){say("The two passwords don't match.",true);return;}
+  go.disabled=true;say('Saving…');
   try{
     var r=await fetch('/auth/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({token:'__TOKEN__',new_password:document.getElementById('p').value})});
-    var d=await r.json();
-    m.textContent = r.ok ? 'Password updated. You can close this tab and log in.' : (d.detail||'Something went wrong.');
-  }catch(err){m.textContent='Network error.';}
+      body:JSON.stringify({token:f.dataset.token,new_password:a})});
+    var d=await r.json().catch(function(){return{};});
+    if(r.ok){f.hidden=true;document.getElementById('done').hidden=false;document.querySelector('h1').textContent='Password updated';}
+    else{say(typeof d.detail==='string'?d.detail:'This reset link is invalid or has expired. Ask for a new one from the sign-in page.',true);go.disabled=false;}
+  }catch(err){say('Network error. Check your connection and try again.',true);go.disabled=false;}
 });
-</script></body></html>"""
+"""
 
 
 def _hash_reset_token(token: str) -> str:
@@ -1220,12 +1243,14 @@ def forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_db)):
 
 
 @app.get('/auth/reset-password')
-def reset_password_page(token: str):
-    """Minimal HTML form opened from the reset email."""
+def reset_password_page(token: str = ""):
+    """The form opened from the reset email, in Sculpt's style."""
     safe_token = re.sub(r"[^A-Za-z0-9_\-]", "", token)[:200]
+    nonce = secrets.token_urlsafe(16)
     return HTMLResponse(
-        RESET_PAGE_HTML.replace("__TOKEN__", safe_token),
-        headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'"},
+        branding.page_html(title="Reset your password", body=RESET_FORM.replace("__TOKEN__", safe_token),
+                           script=RESET_SCRIPT, nonce=nonce),
+        headers={"Content-Security-Policy": branding.page_csp(nonce)},
     )
 
 

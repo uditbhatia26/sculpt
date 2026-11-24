@@ -63,10 +63,12 @@ class TestResend(unittest.TestCase):
     def test_name_is_escaped(self):
         with patch.dict(os.environ, RESEND_ENV), \
              patch.object(mail.httpx, "post", return_value=response(200, {"id": "e1"})) as post:
-            mail.send_verification_email("user@example.com", '<a href="https://evil.test">click</a>', "tok")
+            mail.send_verification_email("user@example.com", "<img/src=x/onerror=alert(1)>", "tok")
         html_body = post.call_args.kwargs["json"]["html"]
-        self.assertNotIn('<a href="https://evil.test">', html_body)
-        self.assertIn("&lt;a href=", html_body)
+        self.assertNotIn("<img/src=x", html_body)
+        self.assertIn("&lt;img/src=x/onerror=alert(1)&gt;", html_body)  # shown as text, not markup
+        self.assertIn("Verify your email for Sculpt", post.call_args.kwargs["json"]["subject"])
+        self.assertIn("Hi ", post.call_args.kwargs["json"]["text"])         # plain-text part is sent too
 
 
 class TestSmtpFallback(unittest.TestCase):

@@ -15,10 +15,11 @@ Two ways to send, picked by what is configured:
 
 Both use:
     MAIL_FROM_NAME   display name (default: Sculpt)
+    DASHBOARD_URL    the website; the emails link to it and load its logo
     MAIL_REPLY_TO    optional: where replies go (useful when MAIL_FROM is a no-reply address)
     APP_BASE_URL     the backend's address; the links in the emails point at it
 """
-import html as html_lib  # not "html": the email builders use that name for the body
+from config import branding
 import smtplib
 import logging
 import os
@@ -38,8 +39,11 @@ def _mask(email: str) -> str:
     return f"{local[:1]}***@{domain}" if domain else "***"
 
 
-def _send_resend(api_key: str, sender: str, to_email: str, subject: str, html_body: str, reply_to: str) -> bool:
+def _send_resend(api_key: str, sender: str, to_email: str, subject: str, html_body: str, reply_to: str,
+                 text_body: str = "") -> bool:
     payload = {"from": sender, "to": [to_email], "subject": subject, "html": html_body}
+    if text_body:
+        payload["text"] = text_body
     if reply_to:
         payload["reply_to"] = reply_to
     try:
@@ -60,7 +64,8 @@ def _send_resend(api_key: str, sender: str, to_email: str, subject: str, html_bo
     return True
 
 
-def _send_smtp(mail_from: str, from_name: str, to_email: str, subject: str, html_body: str, reply_to: str) -> bool:
+def _send_smtp(mail_from: str, from_name: str, to_email: str, subject: str, html_body: str, reply_to: str,
+               text_body: str = "") -> bool:
     mail_password = os.getenv("MAIL_PASSWORD", "")
     if not mail_password:
         logger.warning("[EMAIL] Neither RESEND_API_KEY nor MAIL_PASSWORD is set: email not sent.")
@@ -74,6 +79,8 @@ def _send_smtp(mail_from: str, from_name: str, to_email: str, subject: str, html
     msg["To"]      = to_email
     if reply_to:
         msg["Reply-To"] = reply_to
+    if text_body:  # the plain part goes first; clients show the last part they can render
+        msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
@@ -89,7 +96,7 @@ def _send_smtp(mail_from: str, from_name: str, to_email: str, subject: str, html
         return False
 
 
-def _send(to_email: str, subject: str, html_body: str) -> bool:
+def _send(to_email: str, subject: str, html_body: str, text_body: str = "") -> bool:
     """Send one email. Returns True on success; never raises."""
     mail_from = os.getenv("MAIL_FROM", "").strip()
     from_name = os.getenv("MAIL_FROM_NAME", "Sculpt").strip() or "Sculpt"
@@ -100,114 +107,55 @@ def _send(to_email: str, subject: str, html_body: str) -> bool:
 
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     if api_key:
-        return _send_resend(api_key, f"{from_name} <{mail_from}>", to_email, subject, html_body, reply_to)
-    return _send_smtp(mail_from, from_name, to_email, subject, html_body, reply_to)
+        return _send_resend(api_key, f"{from_name} <{mail_from}>", to_email, subject, html_body, reply_to, text_body)
+    return _send_smtp(mail_from, from_name, to_email, subject, html_body, reply_to, text_body)
+
+
+def _first_name(full_name) -> str:
+    name = str(full_name or "").strip().split(" ")[0]
+    return name[:40] if name else "there"
 
 
 def send_verification_email(to_email: str, full_name: str | None, token: str) -> bool:
-    """Send the email-verification link to a newly signed-up user."""
-    base_url    = os.getenv("APP_BASE_URL", "http://localhost:8000")
-    verify_url  = f"{base_url}/auth/verify-email?token={token}"
-    name_label  = html_lib.escape(full_name or "there")  # a name is user input: never raw HTML
-
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="utf-8"></head>
-    <body style="font-family: 'Segoe UI', Arial, sans-serif; background:#0f1117; margin:0; padding:40px 0;">
-      <table width="100%" cellpadding="0" cellspacing="0">
-        <tr><td align="center">
-          <table width="560" cellpadding="0" cellspacing="0"
-                 style="background:#1a1d2e; border-radius:12px; overflow:hidden;">
-            <!-- Header -->
-            <tr>
-              <td style="background:linear-gradient(135deg,#6c63ff,#a78bfa);
-                         padding:32px 40px; text-align:center;">
-                <h1 style="color:#fff; margin:0; font-size:24px; letter-spacing:-0.5px;">
-                  ✦ ResumeSculpt
-                </h1>
-                <p style="color:rgba(255,255,255,0.8); margin:8px 0 0; font-size:14px;">
-                  AI-Powered Resume Optimization
-                </p>
-              </td>
-            </tr>
-            <!-- Body -->
-            <tr>
-              <td style="padding:40px;">
-                <h2 style="color:#e2e8f0; margin:0 0 16px; font-size:20px;">
-                  Verify your email, {name_label} 👋
-                </h2>
-                <p style="color:#94a3b8; line-height:1.6; margin:0 0 24px;">
-                  Thanks for signing up. Click the button below to verify your email
-                  address and unlock full access to ResumeSculpt.
-                </p>
-                <table cellpadding="0" cellspacing="0">
-                  <tr>
-                    <td align="center"
-                        style="background:linear-gradient(135deg,#6c63ff,#a78bfa);
-                               border-radius:8px;">
-                      <a href="{verify_url}"
-                         style="display:inline-block; padding:14px 32px;
-                                color:#fff; font-weight:600; font-size:15px;
-                                text-decoration:none; border-radius:8px;">
-                        Verify Email Address
-                      </a>
-                    </td>
-                  </tr>
-                </table>
-                <p style="color:#64748b; font-size:13px; margin:24px 0 0;">
-                  This link expires in <strong style="color:#94a3b8;">24 hours</strong>.
-                  If you didn't create an account, you can safely ignore this email.
-                </p>
-                <hr style="border:none; border-top:1px solid #2d3148; margin:32px 0;">
-                <p style="color:#475569; font-size:12px; margin:0;">
-                  Or copy this link into your browser:<br>
-                  <a href="{verify_url}"
-                     style="color:#6c63ff; word-break:break-all;">{verify_url}</a>
-                </p>
-              </td>
-            </tr>
-            <!-- Footer -->
-            <tr>
-              <td style="padding:20px 40px; background:#13162a; text-align:center;">
-                <p style="color:#475569; font-size:12px; margin:0;">
-                  © 2026 ResumeSculpt. All rights reserved.
-                </p>
-              </td>
-            </tr>
-          </table>
-        </td></tr>
-      </table>
-    </body>
-    </html>
-    """
-    return _send(to_email, "Verify your ResumeSculpt email", html)
+    """Send the email-verification link to a newly signed-up user (valid 24 hours)."""
+    base_url = os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/")
+    content = dict(
+        heading=f"Hi {_first_name(full_name)}, confirm your email",
+        paragraphs=[
+            "Thanks for joining Sculpt. Confirm this address to start tailoring your resume: "
+            "uploading it, scoring it against a job and generating a version for the role.",
+        ],
+        button_label="Verify email address",
+        button_url=f"{base_url}/auth/verify-email?token={token}",
+        note="This link expires in 24 hours. If you didn't create a Sculpt account, you can ignore this email.",
+        footer_reason="You're receiving this because this address was used to sign up for Sculpt.",
+    )
+    return _send(
+        to_email, "Verify your email for Sculpt",
+        branding.email_html(preheader="Confirm your email to start tailoring your resume.",
+                            kicker="Verify your email", **content),
+        branding.email_text(**content),
+    )
 
 
 def send_password_reset_email(to_email: str, full_name: str | None, token: str) -> bool:
     """Send a password-reset link (valid 30 minutes)."""
-    base_url   = os.getenv("APP_BASE_URL", "http://localhost:8000")
-    reset_url  = f"{base_url}/auth/reset-password?token={token}"
-    name_label = html_lib.escape(full_name or "there")  # a name is user input: never raw HTML
-    html = f"""
-    <!DOCTYPE html>
-    <html><head><meta charset="utf-8"></head>
-    <body style="font-family:'Segoe UI',Arial,sans-serif;background:#0f1117;margin:0;padding:40px 0;">
-      <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
-        <table width="560" cellpadding="0" cellspacing="0" style="background:#1a1d2e;border-radius:12px;">
-          <tr><td style="padding:40px;">
-            <h2 style="color:#e2e8f0;margin:0 0 16px;">Reset your password, {name_label}</h2>
-            <p style="color:#94a3b8;line-height:1.6;margin:0 0 24px;">
-              We received a request to reset your ResumeSculpt password. This link expires in
-              <strong>30 minutes</strong>. If you didn't ask for this, ignore this email.
-            </p>
-            <a href="{reset_url}" style="display:inline-block;padding:14px 32px;color:#fff;font-weight:600;
-               text-decoration:none;border-radius:8px;background:linear-gradient(135deg,#6c63ff,#a78bfa);">
-              Choose a new password</a>
-            <p style="color:#475569;font-size:12px;margin:24px 0 0;word-break:break-all;">{reset_url}</p>
-          </td></tr>
-        </table>
-      </td></tr></table>
-    </body></html>
-    """
-    return _send(to_email, "Reset your ResumeSculpt password", html)
+    base_url = os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/")
+    content = dict(
+        heading=f"Hi {_first_name(full_name)}, reset your password",
+        paragraphs=[
+            "We received a request to reset the password for your Sculpt account. "
+            "Choose a new one with the button below.",
+        ],
+        button_label="Choose a new password",
+        button_url=f"{base_url}/auth/reset-password?token={token}",
+        note="This link expires in 30 minutes and works once. If you didn't ask for this, ignore this email: "
+             "your password stays the same.",
+        footer_reason="You're receiving this because a password reset was requested for this address on Sculpt.",
+    )
+    return _send(
+        to_email, "Reset your Sculpt password",
+        branding.email_html(preheader="Your link to choose a new Sculpt password.",
+                            kicker="Password reset", **content),
+        branding.email_text(**content),
+    )
