@@ -4,6 +4,8 @@ from uuid import UUID
 
 VALID_TEMPLATES = ("jakes_resume", "classic_ivy", "compact_onepage")
 MAX_JD_CHARS = 10_000
+# Resume YAML comes from at most 12,000 characters of resume text; 40,000 leaves room for markup
+MAX_RESUME_YAML_CHARS = 40_000
 
 
 def _validate_uuid(v: Optional[str]) -> Optional[str]:
@@ -12,7 +14,7 @@ def _validate_uuid(v: Optional[str]) -> Optional[str]:
     try:
         return str(UUID(str(v)))
     except ValueError:
-        raise ValueError("jd_cache_id must be a valid UUID")
+        raise ValueError("must be a valid UUID")
 
 
 def _validate_template(v: Optional[str]) -> Optional[str]:
@@ -75,6 +77,8 @@ class AuthResponse(BaseModel):
     is_admin:         bool          = Field(default=False, description="Whether user has admin privileges")
     weekly_usage:     int           = Field(description="Generations used this week")
     weekly_limit:     int           = Field(description="Max generations allowed per week for their plan")
+    weekly_analysis_usage: int      = Field(default=0, description="ATS analyses used this week")
+    weekly_analysis_limit: int      = Field(default=15, description="Max ATS analyses allowed per week for their plan")
     daily_usage:      int           = Field(default=0, description="Generations made today")
     monthly_usage:    int           = Field(default=0, description="Generations made this calendar month")
     onboarding_step:     str        = Field(default="resume", description="resume | projects | achievements | done")
@@ -95,6 +99,8 @@ class UserProfile(BaseModel):
     is_admin:         bool = False
     weekly_usage:     int
     weekly_limit:     int
+    weekly_analysis_usage: int = 0
+    weekly_analysis_limit: int = 15
     daily_usage:      int = 0
     monthly_usage:    int = 0
     created_at:       str
@@ -256,10 +262,14 @@ class ChangeExplanationResponse(BaseModel):
 
 
 class ExplainChangesRequest(BaseModel):
-    original_yaml: Optional[str] = Field(None, description="Original resume YAML. If omitted, uses current user's base resume.")
-    optimized_yaml: str = Field(..., description="Optimized resume YAML to explain")
-    job_description: Optional[str] = Field(None, description="Target job description")
+    # Length caps keep one request from sending a huge prompt on the server's AI key
+    original_yaml: Optional[str] = Field(None, max_length=MAX_RESUME_YAML_CHARS, description="Original resume YAML. If omitted, uses current user's base resume.")
+    optimized_yaml: str = Field(..., max_length=MAX_RESUME_YAML_CHARS, description="Optimized resume YAML to explain")
+    job_description: Optional[str] = Field(None, max_length=MAX_JD_CHARS, description="Target job description")
+    optimization_id: Optional[str] = Field(None, description="ID of the saved optimization being explained. Its saved explanation is returned when there is one.")
     ai_config: Optional[AIProviderConfig] = Field(None, description="Optional BYOK configuration")
+
+    _check_optimization_id = field_validator("optimization_id")(_validate_uuid)
 
 
 # ==================== ADMIN SCHEMAS (PILLAR 1) ====================

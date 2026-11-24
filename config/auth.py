@@ -44,17 +44,41 @@ def get_password_hash(password: str) -> str:
     ).decode('utf-8')
 
 
+# Every token this server signs names what it is for in its "typ" claim. Only "access"
+# tokens sign someone in: a token made for another job (the GitHub OAuth state, which
+# travels through GitHub and the address bar) must never work as a login.
+ACCESS_TOKEN_TYPE = "access"
+
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Create a JWT access token"""
+    """Create a JWT session (login) token."""
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
     else:
         expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    to_encode.update({"exp": expire})
+
+    to_encode.update({"exp": expire, "typ": ACCESS_TOKEN_TYPE})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+
+def create_scoped_token(sub: str, typ: str, minutes: int, **claims) -> str:
+    """A short-lived signed token for one job, e.g. typ="github_oauth". Never accepted as a login."""
+    if typ == ACCESS_TOKEN_TYPE:
+        raise ValueError("Use create_access_token for session tokens.")
+    payload = {**claims, "sub": sub, "typ": typ,
+               "exp": datetime.now(timezone.utc) + timedelta(minutes=minutes)}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def is_session_token(payload: dict) -> bool:
+    """True for a login token. Tokens issued before "typ" existed carry none; they are
+    accepted unless they carry the old GitHub-state "purpose" claim (they expire within 24 h)."""
+    typ = payload.get("typ")
+    if typ is None:
+        return "purpose" not in payload
+    return typ == ACCESS_TOKEN_TYPE
 
 
 def decode_token(token: str) -> dict:
@@ -84,7 +108,7 @@ def get_current_user(
     try:
         payload = decode_token(token)
         user_id: str = payload.get("sub")
-        if user_id is None:
+        if user_id is None or not is_session_token(payload):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid authentication credentials",

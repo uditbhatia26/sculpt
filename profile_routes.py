@@ -27,7 +27,10 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from config import github_client as gh
-from config.auth import create_access_token, decode_token, get_current_user
+from urllib.parse import urlencode
+
+from config.ai_allowance import ai_allowance
+from config.auth import create_scoped_token, decode_token, get_current_user
 from config.database import get_db
 from config.rate_limit import rate_limit
 from models.database_models import ProfileAchievement, ProfileProject, User
@@ -339,14 +342,14 @@ def github_start(
     private: bool = Query(False, description="Also ask for access to private repositories"),
     current_user: User = Depends(get_current_user),
 ):
-    """The GitHub URL to send the browser to. The signed state ties the callback to this user."""
+    """The GitHub URL to send the browser to. The signed state names the user who started."""
     if not gh.is_configured():
         raise HTTPException(status_code=503, detail="GitHub connection isn't configured on this server.")
-    state = create_access_token(
-        {"sub": str(current_user.id), "purpose": "github_oauth", "private": bool(private)},
-        expires_delta=timedelta(minutes=10),
-    )
+    state = create_scoped_token(str(current_user.id), GITHUB_STATE_TYPE, 10, private=bool(private))
     return {"url": gh.authorize_url(state, private)}
+
+
+GITHUB_STATE_TYPE = "github_oauth"
 
 
 @router.get("/auth/github/callback")
@@ -354,45 +357,67 @@ async def github_callback(
     code: Optional[str] = None,
     state: Optional[str] = None,
     error: Optional[str] = None,
+):
+    """GitHub sends the browser here. Nothing is linked yet: the code goes on to the website,
+    which finishes with the signed-in user's own session (POST /auth/github/complete).
+
+    Linking here, on the state alone, would let someone start a connection on their own
+    account and send the GitHub link to another person: if that person approved it, their
+    GitHub would be linked to the sender's Sculpt account."""
+    if error or not code or not state:
+        return RedirectResponse(f"{dashboard_url()}/?github=cancelled", status_code=302)
+    query = urlencode({"github_code": code, "github_state": state})
+    return RedirectResponse(f"{dashboard_url()}/?{query}", status_code=302)
+
+
+class GitHubCompleteRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=200)
+    state: str = Field(..., min_length=1, max_length=2000)
+
+
+@router.post("/auth/github/complete", dependencies=[Depends(rate_limit("github_complete", 20, 3600))])
+async def github_complete(
+    body: GitHubCompleteRequest,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """GitHub sends the browser here. Link the account, then go back to the dashboard."""
-    def back(result: str) -> RedirectResponse:
-        return RedirectResponse(f"{dashboard_url()}/?github={result}", status_code=302)
-
-    if error or not code or not state:
-        return back("cancelled")
+    """Finish connecting GitHub for the signed-in user. The state must have been issued to this
+    same user, so a connection started by someone else can't land on their account or this one.
+    Always 200 with {"result": connected | in_use | expired | wrong_account | failed}."""
     try:
-        claims = decode_token(state)
+        claims = decode_token(body.state)
     except HTTPException:
-        return back("expired")
-    if claims.get("purpose") != "github_oauth" or not claims.get("sub"):
-        return back("expired")
+        return {"result": "expired"}
+    if claims.get("typ") != GITHUB_STATE_TYPE or not claims.get("sub"):
+        return {"result": "expired"}
+    if claims["sub"] != str(current_user.id):
+        logger.warning(f"[GITHUB] state issued to another account was completed by {current_user.id}")
+        return {"result": "wrong_account"}
 
     try:
-        token, scopes = await gh.exchange_code(code)
+        token, scopes = await gh.exchange_code(body.code)
         profile = await gh.GitHub(token).user()
     except gh.GitHubError as e:
         logger.warning(f"[GITHUB] connect failed: {e}")
-        return back("failed")
+        return {"result": "failed"}
+    if not profile.get("id"):
+        return {"result": "failed"}
 
     def link() -> str:
-        user = db.query(User).filter(User.id == _uuid(claims["sub"])).first()
-        if not user:
-            return "expired"
         github_id = str(profile.get("id"))
-        other = db.query(User).filter(User.github_id == github_id, User.id != user.id).first()
+        other = db.query(User).filter(User.github_id == github_id, User.id != current_user.id).first()
         if other:
             return "in_use"  # one GitHub account backs one Sculpt account
-        user.github_id = github_id
-        user.github_username = profile.get("login")
-        user.github_token_enc = gh.encrypt_token(token)
-        user.github_private_access = "repo" in scopes
+        current_user.github_id = github_id
+        current_user.github_username = profile.get("login")
+        current_user.github_token_enc = gh.encrypt_token(token)
+        current_user.github_private_access = "repo" in scopes
         db.commit()
-        logger.info(f"[GITHUB] {user.email} connected as {user.github_username} (private={user.github_private_access})")
+        logger.info(f"[GITHUB] user {current_user.id} connected as {current_user.github_username} "
+                    f"(private={current_user.github_private_access})")
         return "connected"
 
-    return back(await run_in_threadpool(link))
+    return {"result": await run_in_threadpool(link)}
 
 
 @router.delete("/auth/github")
@@ -690,13 +715,17 @@ class RefineRequest(BaseModel):
 
 
 @router.post("/profile/refine", dependencies=[Depends(rate_limit("refine", 40, 3600))])
-async def refine_text(body: RefineRequest, current_user: User = Depends(get_current_user)):
+async def refine_text(body: RefineRequest, current_user: User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
     """Polish wording without adding facts. Nothing is saved: the user decides whether to keep it."""
     _require_verified(current_user)
     llm = _server_llm()
     original = body.text.strip()
     try:
-        result = await build_refine_chain(llm).ainvoke({"kind": body.kind, "text": original})
+        async with ai_allowance(current_user, "refine", db):
+            result = await build_refine_chain(llm).ainvoke({"kind": body.kind, "text": original})
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[REFINE] failed for {current_user.id}: {e}")
         raise HTTPException(status_code=502, detail="Couldn't polish that just now. Your text is unchanged; you can save it as it is.")

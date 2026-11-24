@@ -61,7 +61,7 @@ class TestAuthRefresh(unittest.TestCase):
         user = make_user()
         app.dependency_overrides[get_current_user] = lambda: user
         app.dependency_overrides[get_db] = lambda: MagicMock()
-        with patch.object(main, "get_weekly_usage", return_value=2), \
+        with patch.object(main, "get_weekly_counts", return_value=(2, 4)), \
              patch.object(main, "get_daily_usage", return_value=1), \
              patch.object(main, "get_monthly_usage", return_value=3):
             res = TestClient(app).post("/auth/refresh")
@@ -70,6 +70,8 @@ class TestAuthRefresh(unittest.TestCase):
         self.assertTrue(body["is_byok_allowed"])
         self.assertTrue(body["is_admin"])
         self.assertEqual(body["weekly_usage"], 2)
+        self.assertEqual(body["weekly_analysis_usage"], 4)
+        self.assertEqual(body["weekly_analysis_limit"], main.PLAN_ANALYSIS_LIMITS[user.plan])
 
 
 class TestSchemaValidators(unittest.TestCase):

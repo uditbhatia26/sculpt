@@ -307,6 +307,133 @@ class TestReserveGenerationSlot(unittest.TestCase):
         main.release_generation_slot(uuid.uuid4(), main.get_week_start(), db)  # logged, not raised
 
 
+class TestAnalysisAllowance(Base):
+    """Analyze takes one analysis from its own weekly allowance and gives it back on failure."""
+    BODY = {"job_desc": JD}
+
+    def _post(self, ats, body=None):
+        jd = parsedJobDescription(job_title="Eng", skills=["Python"], job_description="d")
+        reserve = MagicMock(return_value=(main.get_week_start(), 1))
+        release = MagicMock()
+        with patch.object(main, "resolve_request_llm", return_value=object()), \
+             patch.object(main, "get_or_parse_jd", AsyncMock(return_value=(jd, "id"))), \
+             patch.object(main, "ats_detailed", ats), \
+             patch.object(main, "reserve_analysis_slot", reserve), \
+             patch.object(main, "release_analysis_slot", release):
+            res = self.client.post("/calculate-ats-detailed", json=body or self.BODY)
+        return res, reserve, release
+
+    def test_success_counts_one_analysis(self):
+        # A stand-in result: only the counting matters here, not the response body's validation.
+        self.client = TestClient(app, raise_server_exceptions=False)
+        _, reserve, release = self._post(AsyncMock(return_value=MagicMock(overall_score=70)))
+        reserve.assert_called_once()
+        release.assert_not_called()
+
+    def test_failed_analysis_is_given_back(self):
+        res, reserve, release = self._post(AsyncMock(side_effect=Exception("boom")))
+        self.assertEqual(res.status_code, 500)
+        reserve.assert_called_once()
+        release.assert_called_once()
+
+    def test_full_week_is_429_and_no_model_call(self):
+        ats = AsyncMock()
+        with patch.object(main, "resolve_request_llm", return_value=object()), \
+             patch.object(main, "ats_detailed", ats), \
+             patch.object(main, "reserve_analysis_slot",
+                          side_effect=main.HTTPException(status_code=429, detail="Weekly analysis limit reached")):
+            res = self.client.post("/calculate-ats-detailed", json=self.BODY)
+        self.assertEqual(res.status_code, 429)
+        self.assertIn("analysis limit", res.json()["detail"])
+        ats.assert_not_called()
+
+    def test_byok_is_not_counted(self):
+        self.user.is_byok_allowed = True
+        body = {**self.BODY, "ai_config": {"provider": "openai", "api_key": "sk-test", "model": "gpt-6-luna"}}
+        _, reserve, _ = self._post(AsyncMock(side_effect=Exception("boom")), body)
+        reserve.assert_not_called()
+
+
+class TestSavedExplanations(Base):
+    """An optimization is explained once; afterwards the saved explanation is returned."""
+    SAVED = {"summary_rationale": "Led with React.", "key_enhancements": [], "skills_strategy": ["React"],
+             "preservation_notes": "Dates kept."}
+
+    def setUp(self):
+        super().setUp()
+        from config.rate_limit import reset_rate_limits
+        reset_rate_limits()
+
+    def _record(self, saved=None):
+        r = MagicMock()
+        r.id = uuid.uuid4()
+        r.change_explanation = saved
+        r.optimized_yaml = "name: Jane\n"
+        r.job_description = "Saved JD text"
+        return r
+
+    def _post(self, record, explain, body=None):
+        with patch.object(main, "find_explained_record", return_value=record), \
+             patch.object(main, "resolve_request_llm", return_value=object()), \
+             patch.object(main, "explain_resume_changes", explain):
+            return self.client.post("/explain-changes", json=body or {"optimized_yaml": "name: Jane\n"})
+
+    def test_saved_explanation_is_returned_without_a_model_call(self):
+        explain = AsyncMock()
+        res = self._post(self._record(self.SAVED), explain)
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["summary_rationale"], "Led with React.")
+        explain.assert_not_called()
+
+    def test_first_explanation_is_generated_and_saved(self):
+        from schema.schema import ChangeExplanationResponse
+        record = self._record()
+        explain = AsyncMock(return_value=ChangeExplanationResponse(**self.SAVED))
+        res = self._post(record, explain)
+        self.assertEqual(res.status_code, 200, res.text)
+        explain.assert_awaited_once()
+        self.assertEqual(explain.await_args.kwargs["job_description"], "Saved JD text")  # the record's JD wins
+        self.assertEqual(record.change_explanation["summary_rationale"], "Led with React.")
+        self.db.commit.assert_called()
+
+    def test_unsaved_resume_is_still_explained(self):
+        from schema.schema import ChangeExplanationResponse
+        explain = AsyncMock(return_value=ChangeExplanationResponse(**self.SAVED))
+        res = self._post(None, explain, {"optimized_yaml": "name: Jane\n", "job_description": "JD"})
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(explain.await_args.kwargs["job_description"], "JD")
+
+    def test_bad_optimization_id_is_422(self):
+        res = self.client.post("/explain-changes", json={"optimized_yaml": "x", "optimization_id": "nope"})
+        self.assertEqual(res.status_code, 422)
+
+
+class TestReserveAnalysisSlot(unittest.TestCase):
+    def test_statement_counts_analyses_not_generations(self):
+        from sqlalchemy.dialects import postgresql
+        db = MagicMock()
+        db.execute.return_value.scalar.return_value = 4
+        _, count = main.reserve_analysis_slot(make_user(), db)
+        self.assertEqual(count, 4)
+        sql = str(db.execute.call_args[0][0].compile(dialect=postgresql.dialect()))
+        self.assertIn("ON CONFLICT ON CONSTRAINT uq_generation_usage_user_week DO UPDATE", sql)
+        self.assertIn("WHERE generation_usage.analysis_count <", sql)
+        self.assertNotIn("SET count", sql)
+
+    def test_full_week_raises_429(self):
+        db = MagicMock()
+        db.execute.return_value.scalar.return_value = None
+        with self.assertRaises(main.HTTPException) as ctx:
+            main.reserve_analysis_slot(make_user(), db)
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertIn("Pro", ctx.exception.detail)
+
+    def test_release_never_raises(self):
+        db = MagicMock()
+        db.commit.side_effect = Exception("db down")
+        main.release_analysis_slot(uuid.uuid4(), main.get_week_start(), db)
+
+
 class TestGoogleAuth(Base):
     def _google(self, tokeninfo, userinfo, status=200):
         class Resp:

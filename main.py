@@ -31,11 +31,13 @@ from config.latex_generator import (
 )
 from config.email import send_verification_email, send_password_reset_email
 from config.rate_limit import rate_limit
+from config.ai_allowance import ai_allowance
 from io import BytesIO
 from config.resume_functions import ats_detailed, optimize_resume_agentic, parse_jd, explain_resume_changes
 from models.chains import build_res2yaml_chain
 from models.llm_factory import build_llm, build_server_llm, PROVIDER_DEFAULTS, SERVER_PROVIDER_ORDER
 from profile_routes import router as profile_router, onboarding_state, build_profile_addons
+from billing_routes import router as billing_router, expire_if_lapsed
 import yaml
 from datetime import datetime, timedelta, date, timezone
 import os
@@ -81,6 +83,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="ResumeSculpt API", version="2.0.0", lifespan=lifespan)
 app.include_router(profile_router)  # profile pool, onboarding, GitHub connection, Chisel
+app.include_router(billing_router)  # Pro subscription through Razorpay
 
 MAX_RESUME_CHARS = 12_000
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
@@ -127,6 +130,12 @@ async def cors_and_security_middleware(request, call_next):
 PLAN_LIMITS = {
     "free": 5,
     "pro":  30,
+}
+
+# ATS analyses ("Analyze compatibility") per week, counted separately from generations.
+PLAN_ANALYSIS_LIMITS = {
+    "free": 15,
+    "pro":  100,
 }
 
 
@@ -214,6 +223,15 @@ def get_weekly_usage(user_id, db: Session) -> int:
     return record.count if record else 0
 
 
+def get_weekly_counts(user_id, db: Session) -> tuple[int, int]:
+    """(generations, analyses) used this week, in one query."""
+    row = db.query(GenerationUsage.count, GenerationUsage.analysis_count).filter(
+        GenerationUsage.user_id == user_id,
+        GenerationUsage.week_start == get_week_start(),
+    ).first()
+    return (row[0] or 0, row[1] or 0) if row else (0, 0)
+
+
 def get_weekly_usage_map(user_ids, db: Session) -> dict:
     """Weekly generation counts for many users in one query: {user_id: count}."""
     ids = list(user_ids)
@@ -276,6 +294,53 @@ def release_generation_slot(user_id, week_start: date, db: Session) -> None:
     except Exception as e:
         db.rollback()
         logger.error(f"[QUOTA] Could not release a generation slot for {user_id}: {e}")
+
+
+def reserve_analysis_slot(user: User, db: Session) -> tuple[date, int]:
+    """Atomically take one ATS analysis from this week's analysis allowance; returns
+    (week_start, new_count). Same single-statement pattern as reserve_generation_slot().
+    Raises 429 when the week's analyses are used up."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    week_start = get_week_start()
+    limit = PLAN_ANALYSIS_LIMITS.get(user.plan, PLAN_ANALYSIS_LIMITS["free"])
+    stmt = pg_insert(GenerationUsage).values(
+        id=uuid.uuid4(), user_id=user.id, week_start=week_start, count=0, analysis_count=1,
+    )
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_generation_usage_user_week",
+        set_={"analysis_count": GenerationUsage.analysis_count + 1, "updated_at": func.now()},
+        where=GenerationUsage.analysis_count < limit,
+    ).returning(GenerationUsage.analysis_count)
+    try:
+        new_count = db.execute(stmt).scalar()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    if new_count is None:
+        pro_limit = PLAN_ANALYSIS_LIMITS["pro"]
+        raise HTTPException(
+            status_code=429,
+            detail=f"Weekly analysis limit reached ({limit}/{limit}). "
+                   f"{f'Upgrade to Pro for {pro_limit} analyses/week.' if user.plan == 'free' else 'Limit resets every Monday.'}"
+        )
+    return week_start, new_count
+
+
+def release_analysis_slot(user_id, week_start: date, db: Session) -> None:
+    """Give back an analysis taken by reserve_analysis_slot() when the analysis failed. Best-effort."""
+    try:
+        db.rollback()
+        db.query(GenerationUsage).filter(
+            GenerationUsage.user_id == user_id,
+            GenerationUsage.week_start == week_start,
+            GenerationUsage.analysis_count > 0,
+        ).update({GenerationUsage.analysis_count: GenerationUsage.analysis_count - 1}, synchronize_session=False)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[QUOTA] Could not release an analysis slot for {user_id}: {e}")
 
 
 # Users with a generation running in this worker. A second click while one is running gets a
@@ -544,7 +609,7 @@ async def get_or_parse_jd(raw_jd: str, db: Session, llm=None):
 
 def build_auth_response(user: User, access_token: str, db: Session) -> AuthResponse:
     """Build a consistent AuthResponse including paywall fields."""
-    weekly_usage  = get_weekly_usage(user.id, db)
+    weekly_usage, weekly_analyses = get_weekly_counts(user.id, db)
     weekly_limit  = PLAN_LIMITS.get(user.plan, PLAN_LIMITS["free"])
     daily_usage   = get_daily_usage(user.id, db)
     monthly_usage = get_monthly_usage(user.id, db)
@@ -562,6 +627,8 @@ def build_auth_response(user: User, access_token: str, db: Session) -> AuthRespo
         is_admin=bool(user.is_admin),
         weekly_usage=weekly_usage,
         weekly_limit=weekly_limit,
+        weekly_analysis_usage=weekly_analyses,
+        weekly_analysis_limit=PLAN_ANALYSIS_LIMITS.get(user.plan, PLAN_ANALYSIS_LIMITS["free"]),
         daily_usage=daily_usage,
         monthly_usage=monthly_usage,
         **onboarding_state(user),
@@ -661,6 +728,11 @@ def llm_error_to_http(e: Exception, fallback: str) -> HTTPException:
     return HTTPException(status_code=500, detail=fallback)
 
 
+def uses_byok(user: User, client_config) -> bool:
+    """True when this request runs on the user's own key (so server allowances don't apply)."""
+    return bool(user.is_byok_allowed and client_config and getattr(client_config, "api_key", None))
+
+
 def require_verified_email(user: User) -> None:
     if not user.email_verified:
         raise HTTPException(
@@ -686,12 +758,20 @@ async def parse_job_description(
 ):
     """Parse and cache a job description. Returns a jd_cache_id the client should
     pass to /calculate-ats-detailed and /optimize-resume to skip repeated LLM parsing."""
+    require_verified_email(current_user)
     if not request.job_desc.strip():
         raise HTTPException(status_code=400, detail="Job description cannot be empty.")
 
     request_llm = resolve_request_llm(current_user, request.ai_config, db, enforce_quota=False)
-    parsed, cache_id = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
-    logger.info(f"JD parsed/cached for {current_user.email}: cache_id={cache_id}")
+
+    # A job someone already parsed is free; a new one counts toward today's allowance
+    cached = await run_in_threadpool(_jd_cache_lookup, db, jd_hash(request.job_desc))
+    if cached:
+        parsed, cache_id = cached
+    else:
+        async with ai_allowance(current_user, "jd_parse", db, skip=uses_byok(current_user, request.ai_config)):
+            parsed, cache_id = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
+    logger.info(f"JD parsed/cached for user {current_user.id}: cache_id={cache_id}")
     return {
         "jd_cache_id": cache_id,
         "job_title":   parsed.job_title,
@@ -805,7 +885,8 @@ def get_current_user_profile(
     db: Session = Depends(get_db)
 ):
     """Get current authenticated user's profile including paywall status."""
-    weekly_usage  = get_weekly_usage(current_user.id, db)
+    expire_if_lapsed(current_user, db)
+    weekly_usage, weekly_analyses = get_weekly_counts(current_user.id, db)
     weekly_limit  = PLAN_LIMITS.get(current_user.plan, PLAN_LIMITS["free"])
     daily_usage   = get_daily_usage(current_user.id, db)
     monthly_usage = get_monthly_usage(current_user.id, db)
@@ -822,9 +903,13 @@ def get_current_user_profile(
         "is_admin":           bool(current_user.is_admin),
         "weekly_usage":       weekly_usage,
         "weekly_limit":       weekly_limit,
+        "weekly_analysis_usage": weekly_analyses,
+        "weekly_analysis_limit": PLAN_ANALYSIS_LIMITS.get(current_user.plan, PLAN_ANALYSIS_LIMITS["free"]),
         "daily_usage":        daily_usage,
         "monthly_usage":      monthly_usage,
         "created_at":         current_user.created_at.isoformat() if current_user.created_at else None,
+        "subscription_status": current_user.subscription_status,
+        "pro_until":          current_user.pro_until.isoformat() if current_user.pro_until else None,
         **onboarding_state(current_user),
     }
 
@@ -1213,11 +1298,12 @@ async def upload_resume(
 
     upload_llm = resolve_request_llm(current_user, client_cfg, db, enforce_quota=False)
 
-
-    # Parse resume to YAML via AI — wrap so LLM errors surface as 4xx, not 500
+    # Parse resume to YAML via AI — wrap so LLM errors surface as 4xx, not 500.
+    # Server AI: counts toward today's upload allowance (given back if the parse fails).
     try:
-        res2yaml = build_res2yaml_chain(upload_llm)
-        response = await res2yaml.ainvoke(input={"resume_content": resume_content})
+        async with ai_allowance(current_user, "upload", db, skip=uses_byok(current_user, client_cfg)):
+            res2yaml = build_res2yaml_chain(upload_llm)
+            response = await res2yaml.ainvoke(input={"resume_content": resume_content})
         resume_yaml = response.content
     except HTTPException:
         raise
@@ -1326,27 +1412,36 @@ async def calculate_ats_detailed(
         raise HTTPException(status_code=404, detail="No resume found. Please upload a resume first.")
 
     # Resolve per-request LLM (BYOK if allowed & supplied, else server fallback)
+    is_byok_in_use = bool(current_user.is_byok_allowed and request.ai_config and getattr(request.ai_config, "api_key", None))
     request_llm = resolve_request_llm(current_user, request.ai_config, db, enforce_quota=False)
 
-    # Use cached parse if the client provided a jd_cache_id
-    parsed_jd = None
-    if request.jd_cache_id:
-        parsed_jd = await run_in_threadpool(load_cached_jd, db, request.jd_cache_id)
-        if parsed_jd:
-            logger.info(f"[CACHE HIT] Reused parsed JD for ATS (cache_id={request.jd_cache_id})")
-        else:
-            logger.warning(f"jd_cache_id {request.jd_cache_id} not found — falling back to live parse")
-            parsed_jd, _ = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
-    else:
-        parsed_jd, _ = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
-
+    # Server AI: take one analysis from this week's allowance up front; it is given back if
+    # the analysis fails, so a failed analysis never counts. BYOK analyses are not counted.
+    slot = None if is_byok_in_use else await run_in_threadpool(reserve_analysis_slot, current_user, db)
     try:
-        result = await ats_detailed(current_user.resume_yaml, parsed_jd, request_llm)
+        # Use cached parse if the client provided a jd_cache_id
+        parsed_jd = None
+        if request.jd_cache_id:
+            parsed_jd = await run_in_threadpool(load_cached_jd, db, request.jd_cache_id)
+            if parsed_jd:
+                logger.info(f"[CACHE HIT] Reused parsed JD for ATS (cache_id={request.jd_cache_id})")
+            else:
+                logger.warning(f"jd_cache_id {request.jd_cache_id} not found — falling back to live parse")
+                parsed_jd, _ = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
+        else:
+            parsed_jd, _ = await get_or_parse_jd(request.job_desc, db, llm=request_llm)
+
+        try:
+            result = await ats_detailed(current_user.resume_yaml, parsed_jd, request_llm)
+        except Exception as e:
+            logger.error(f"ATS error for {current_user.id}: {e}")
+            raise llm_error_to_http(e, "Unable to calculate ATS score. Please try again.")
         logger.info(f"ATS score for {current_user.email}: {result.overall_score}")
         return result
-    except Exception as e:
-        logger.error(f"ATS error for {current_user.id}: {e}")
-        raise llm_error_to_http(e, "Unable to calculate ATS score. Please try again.")
+    except BaseException:
+        if slot:
+            await asyncio.shield(run_in_threadpool(release_analysis_slot, current_user.id, slot[0], db))
+        raise
 
 
 @app.post('/optimize-resume')
@@ -1531,6 +1626,7 @@ async def _run_optimization(request, current_user: User, db: Session, request_ll
 
         return {
             "message":                    "Resume optimized successfully",
+            "optimization_id":            str(record.id),
             "original_score":             round(original_score_value, 2),
             "optimized_score":            round(optimized_score, 2),
             "score_improvement":          round(optimized_score - original_score_value, 2),
@@ -1560,16 +1656,60 @@ async def _run_optimization(request, current_user: User, db: Session, request_ll
 
 # ==================== EXPLAIN CHANGES ENDPOINT ====================
 
+_explain_rate_limit = rate_limit("explain", 30, 3600)
+
+
+def find_explained_record(user_id, optimization_id, optimized_yaml, db: Session):
+    """The user's saved optimization this explanation belongs to, or None.
+    By id when the client sends one, otherwise the newest record with the same optimized YAML."""
+    q = db.query(OptimizedResume).filter(OptimizedResume.user_id == user_id)
+    if optimization_id:
+        return q.filter(OptimizedResume.id == uuid.UUID(optimization_id)).first()
+    return (q.filter(OptimizedResume.optimized_yaml == optimized_yaml)
+             .order_by(OptimizedResume.created_at.desc()).first())
+
+
+def save_explanation(record, explanation: ChangeExplanationResponse, db: Session) -> None:
+    """Store the explanation on its record. Best-effort: the user still gets the explanation."""
+    try:
+        record.change_explanation = ChangeExplanationResponse.model_validate(
+            explanation.model_dump() if hasattr(explanation, "model_dump") else explanation
+        ).model_dump()
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning(f"Could not save the change explanation for record {record.id}: {e}")
+
+
 @app.post("/explain-changes", response_model=ChangeExplanationResponse)
 async def explain_changes_endpoint(
     request: ExplainChangesRequest,
+    http_request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     Explain the strategic changes between the original resume and the optimized version.
     Called on-demand only when the user clicks 'Why were these changes made?' in the UI.
+    The first explanation for a saved optimization is stored on it and returned from there
+    afterwards, so the same resume is never explained (and paid for) twice.
     """
+    require_verified_email(current_user)
+    if not request.optimized_yaml and not request.optimization_id:
+        raise HTTPException(status_code=400, detail="Optimized resume YAML is required to explain changes.")
+
+    record = await run_in_threadpool(
+        find_explained_record, current_user.id, request.optimization_id, request.optimized_yaml, db
+    )
+    if record is not None and record.change_explanation:
+        try:
+            return ChangeExplanationResponse.model_validate(record.change_explanation)
+        except Exception as e:  # an older or damaged saved shape: generate a fresh one below
+            logger.warning(f"Saved explanation for record {record.id} is unreadable, regenerating: {e}")
+
+    # Only new explanations count toward the hourly limit; saved ones are free to reopen.
+    _explain_rate_limit(http_request)
+
     original_yaml = request.original_yaml or current_user.resume_yaml
     if not original_yaml:
         raise HTTPException(
@@ -1577,27 +1717,35 @@ async def explain_changes_endpoint(
             detail="Original resume is required. Please upload a resume first."
         )
 
-    if not request.optimized_yaml:
+    optimized_yaml = request.optimized_yaml or (record.optimized_yaml if record is not None else None)
+    if not optimized_yaml:
         raise HTTPException(
             status_code=400,
             detail="Optimized resume YAML is required to explain changes."
         )
+    # The saved record's job description is the one this resume was tailored to.
+    job_description = (record.job_description if record is not None else None) or request.job_description or ""
 
     # Resolve LLM via unified resolver
     request_llm = resolve_request_llm(current_user, request.ai_config, db, enforce_quota=False)
 
-
     try:
-        explanation = await explain_resume_changes(
-            original_yaml=original_yaml,
-            optimized_yaml=request.optimized_yaml,
-            job_description=request.job_description or "",
-            llm=request_llm,
-        )
-        return explanation
+        async with ai_allowance(current_user, "explain", db, skip=uses_byok(current_user, request.ai_config)):
+            explanation = await explain_resume_changes(
+                original_yaml=original_yaml,
+                optimized_yaml=optimized_yaml,
+                job_description=job_description,
+                llm=request_llm,
+            )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error explaining changes for {current_user.id}: {e}")
         raise llm_error_to_http(e, "Unable to generate change explanation. Please try again.")
+
+    if record is not None:
+        await run_in_threadpool(save_explanation, record, explanation, db)
+    return explanation
 
 
 # ==================== HISTORY ENDPOINT ====================
@@ -1629,6 +1777,7 @@ def get_my_optimizations(
             "created_at":           r.created_at.isoformat() if r.created_at else None,
             "selected_template":    getattr(r, "selected_template", None) or "jakes_resume",
             "optimized_yaml":       r.optimized_yaml,
+            "has_explanation":      bool(r.change_explanation),
         }
         for r in records
     ]

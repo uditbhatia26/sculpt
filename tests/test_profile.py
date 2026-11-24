@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 
 import main
 import profile_routes as pr
+from config import auth
 from config import github_client as gh
 from config.rate_limit import reset_rate_limits
 from main import app, get_current_user, get_db
@@ -432,48 +433,97 @@ class TestGitHubConnect(Base):
         with patch.dict(os.environ, {"GITHUB_CLIENT_ID": "", "GITHUB_CLIENT_SECRET": ""}):
             self.assertEqual(self.client.get("/auth/github/start").status_code, 503)
 
-    def _callback(self, state, other_user=None, scopes=frozenset()):
-        self.db.query.return_value.filter.return_value.first.side_effect = [self.user, other_user]
+    def _complete(self, state, other_user=None, scopes=frozenset()):
+        self.db.query.return_value.filter.return_value.first.return_value = other_user
         client = MagicMock()
         client.user = AsyncMock(return_value={"id": 777, "login": "janedev"})
+        exchange = AsyncMock(return_value=("gho_new", set(scopes)))
         with patch.dict(os.environ, self.ENV), \
-             patch.object(pr.gh, "exchange_code", AsyncMock(return_value=("gho_new", set(scopes)))), \
+             patch.object(pr.gh, "exchange_code", exchange), \
              patch.object(pr.gh, "GitHub", return_value=client):
-            return self.client.get(f"/auth/github/callback?code=abc&state={state}", follow_redirects=False)
+            res = self.client.post("/auth/github/complete", json={"code": "abc", "state": state})
+        self.exchange = exchange
+        return res
 
-    def _state(self, **claims):
-        return pr.create_access_token({"sub": str(self.user.id), "purpose": "github_oauth", **claims},
-                                      expires_delta=timedelta(minutes=10))
+    def _state(self, sub=None, **claims):
+        return auth.create_scoped_token(sub or str(self.user.id), pr.GITHUB_STATE_TYPE, 10, **claims)
 
-    def test_callback_links_the_account_and_stores_the_token_encrypted(self):
-        res = self._callback(self._state())
-        self.assertEqual(res.headers["location"], "http://dash.test/?github=connected")
+    def test_callback_links_nothing_and_hands_the_code_to_the_website(self):
+        with patch.dict(os.environ, self.ENV), \
+             patch.object(pr.gh, "exchange_code", AsyncMock()) as exchange:
+            res = self.client.get("/auth/github/callback?code=abc&state=s.t.u", follow_redirects=False)
+        self.assertEqual(res.headers["location"], "http://dash.test/?github_code=abc&github_state=s.t.u")
+        exchange.assert_not_called()
+        self.db.commit.assert_not_called()
+
+    def test_complete_links_the_account_and_stores_the_token_encrypted(self):
+        res = self._complete(self._state())
+        self.assertEqual(res.json(), {"result": "connected"})
         self.assertEqual(self.user.github_username, "janedev")
         self.assertEqual(self.user.github_id, "777")
         self.assertNotIn("gho_new", self.user.github_token_enc)
         self.assertEqual(gh.decrypt_token(self.user.github_token_enc), "gho_new")
         self.assertFalse(self.user.github_private_access)
 
-    def test_callback_records_private_access_when_granted(self):
-        self._callback(self._state(private=True), scopes={"repo"})
+    def test_complete_records_private_access_when_granted(self):
+        self._complete(self._state(private=True), scopes={"repo"})
         self.assertTrue(self.user.github_private_access)
 
     def test_github_account_already_linked_elsewhere(self):
-        res = self._callback(self._state(), other_user=make_user())
-        self.assertEqual(res.headers["location"], "http://dash.test/?github=in_use")
+        res = self._complete(self._state(), other_user=make_user())
+        self.assertEqual(res.json(), {"result": "in_use"})
+        self.assertEqual(self.user.github_username, "jane")
 
-    def test_forged_or_wrong_purpose_state_is_refused(self):
-        with patch.dict(os.environ, self.ENV):
-            forged = self.client.get("/auth/github/callback?code=abc&state=not.a.jwt", follow_redirects=False)
-            session_token = pr.create_access_token({"sub": str(self.user.id)})  # a login token is not a state
-            wrong = self.client.get(f"/auth/github/callback?code=abc&state={session_token}", follow_redirects=False)
-        self.assertEqual(forged.headers["location"], "http://dash.test/?github=expired")
-        self.assertEqual(wrong.headers["location"], "http://dash.test/?github=expired")
+    def test_connection_started_by_another_account_is_refused(self):
+        """The login-CSRF case: someone else's state, finished in this user's browser."""
+        res = self._complete(self._state(sub=str(uuid.uuid4())))
+        self.assertEqual(res.json(), {"result": "wrong_account"})
+        self.exchange.assert_not_called()
+        self.assertEqual(self.user.github_username, "jane")
+
+    def test_forged_or_wrong_type_state_is_refused(self):
+        forged = self._complete("not.a.jwt")
+        login = self._complete(auth.create_access_token({"sub": str(self.user.id)}))  # a login token is not a state
+        self.assertEqual(forged.json(), {"result": "expired"})
+        self.assertEqual(login.json(), {"result": "expired"})
+        self.exchange.assert_not_called()
 
     def test_user_cancelling_on_github_comes_back_cleanly(self):
         with patch.dict(os.environ, self.ENV):
             res = self.client.get("/auth/github/callback?error=access_denied&state=x", follow_redirects=False)
         self.assertEqual(res.headers["location"], "http://dash.test/?github=cancelled")
+
+
+class TestTokenTypes(unittest.TestCase):
+    """Only session tokens sign someone in."""
+
+    def _user_for(self, token):
+        from fastapi.security import HTTPAuthorizationCredentials
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = make_user()
+        return auth.get_current_user(HTTPAuthorizationCredentials(scheme="Bearer", credentials=token), db)
+
+    def test_session_token_signs_in(self):
+        self.assertIsNotNone(self._user_for(auth.create_access_token({"sub": str(uuid.uuid4())})))
+
+    def test_github_state_is_not_a_login(self):
+        state = auth.create_scoped_token(str(uuid.uuid4()), pr.GITHUB_STATE_TYPE, 10)
+        with self.assertRaises(main.HTTPException) as ctx:
+            self._user_for(state)
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_old_style_github_state_is_not_a_login(self):
+        from jose import jwt
+        old = jwt.encode({"sub": str(uuid.uuid4()), "purpose": "github_oauth",
+                          "exp": NOW + timedelta(minutes=10)}, auth.SECRET_KEY, algorithm=auth.ALGORITHM)
+        with self.assertRaises(main.HTTPException):
+            self._user_for(old)
+
+    def test_session_token_issued_before_types_still_works(self):
+        from jose import jwt
+        old = jwt.encode({"sub": str(uuid.uuid4()), "exp": NOW + timedelta(hours=1)},
+                         auth.SECRET_KEY, algorithm=auth.ALGORITHM)
+        self.assertIsNotNone(self._user_for(old))
 
 
 class TestRepoReader(unittest.TestCase):

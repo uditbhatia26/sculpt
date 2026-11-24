@@ -53,6 +53,12 @@ class User(Base):
     chisel_period_start         = Column(DateTime(timezone=True), nullable=True)
     chisel_period_adds          = Column(Integer, nullable=False, default=0, server_default="0")
 
+    # Billing (Razorpay subscription). `plan` above is what limits read; these track the
+    # subscription behind it. pro_until is the end of the paid period.
+    razorpay_subscription_id    = Column(String, nullable=True, index=True)
+    subscription_status         = Column(String, nullable=True)   # created | active | cancelling | cancelled | halted | completed
+    pro_until                   = Column(DateTime(timezone=True), nullable=True)
+
     created_at          = Column(DateTime(timezone=True), server_default=func.now())
     updated_at          = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -61,6 +67,7 @@ class User(Base):
     generation_usage    = relationship("GenerationUsage",  back_populates="user", cascade="all, delete-orphan")
     profile_projects    = relationship("ProfileProject", back_populates="user", cascade="all, delete-orphan")
     profile_achievements = relationship("ProfileAchievement", back_populates="user", cascade="all, delete-orphan")
+    payments            = relationship("Payment", back_populates="user", cascade="all, delete-orphan")
 
 
 
@@ -80,6 +87,7 @@ class OptimizedResume(Base):
     selected_template   = Column(String, default="jakes_resume")
     keywords_added      = Column(JSONB, nullable=True)                          # List[str]
     improvements_made   = Column(JSONB, nullable=True)                          # List[str]
+    change_explanation  = Column(JSONB, nullable=True)                          # ChangeExplanationResponse, saved on first "Explain changes"
     ai_provider         = Column(String, nullable=True)                         # BYOK: provider used (openai/anthropic/…)
     ai_model            = Column(String, nullable=True)                         # BYOK: model used (gpt-4o-mini/…)
     created_at          = Column(DateTime(timezone=True), server_default=func.now())
@@ -97,6 +105,7 @@ class GenerationUsage(Base):
     user_id     = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     week_start  = Column(Date, nullable=False)   # Monday of the ISO week, e.g. 2026-02-23
     count       = Column(Integer, nullable=False, default=0)
+    analysis_count = Column(Integer, nullable=False, default=0, server_default="0")  # ATS analyses this week
     updated_at  = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
     # Relationship
@@ -164,3 +173,35 @@ class ProfileAchievement(Base):
     updated_at      = Column(DateTime(timezone=True), onupdate=func.now())
 
     user            = relationship("User", back_populates="profile_achievements")
+
+
+class AIDailyUsage(Base):
+    """Server-paid AI calls per user, per UTC day, per kind (see config/ai_allowance.py)."""
+    __tablename__ = "ai_daily_usage"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id     = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    day         = Column(Date, nullable=False)
+    bucket      = Column(String(32), nullable=False)    # upload | jd_parse | explain | refine
+    count       = Column(Integer, nullable=False, default=0)
+    updated_at  = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "day", "bucket", name="uq_ai_daily_usage_user_day_bucket"),
+    )
+
+
+class Payment(Base):
+    """A payment Razorpay confirmed for a user's subscription (one row per Razorpay payment)."""
+    __tablename__ = "payments"
+
+    id                       = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id                  = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    razorpay_payment_id      = Column(String, nullable=False, unique=True)
+    razorpay_subscription_id = Column(String, nullable=True)
+    amount                   = Column(Integer, nullable=False)       # smallest unit (paise)
+    currency                 = Column(String, nullable=False, default="INR")
+    status                   = Column(String, nullable=False, default="captured")
+    created_at               = Column(DateTime(timezone=True), server_default=func.now())
+
+    user                     = relationship("User", back_populates="payments")
